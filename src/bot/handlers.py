@@ -55,6 +55,17 @@ async def _reply_html(message: Message, text: str) -> None:
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 
+async def _reply_plain(message: Message, text: str) -> None:
+    """Send text without HTML parsing.
+
+    Use this whenever the message contains dynamic content we don't
+    fully control (an exception's repr, a tracker error, raw user text).
+    Telegram's HTML parser otherwise rejects ``<`` / ``>`` characters
+    that look like unsupported tags and the whole reply blows up.
+    """
+    await message.answer(text, parse_mode=None)
+
+
 # =============================================================================
 # /start, /help
 # =============================================================================
@@ -107,7 +118,7 @@ async def cmd_block(message: Message) -> None:
     text = (message.text or "").strip()
     parts = text.split()
     if len(parts) < 2:
-        await message.answer("Usage: /block <id>")
+        await _reply_plain(message, "Usage: /block <id>")
         return
     try:
         block_id = int(parts[1])
@@ -127,7 +138,7 @@ async def cmd_cancel(message: Message, engine: BlockEngine) -> None:
     text = (message.text or "").strip()
     parts = text.split()
     if len(parts) < 2:
-        await message.answer("Usage: /cancel <id>")
+        await _reply_plain(message, "Usage: /cancel <id>")
         return
     try:
         block_id = int(parts[1])
@@ -151,7 +162,7 @@ async def cmd_balance(message: Message, client: BinanceClient) -> None:
         usdt = await client.get_balance_usdt()
     except Exception as exc:  # noqa: BLE001
         logger.exception("balance fetch failed")
-        await message.answer(f"Failed to fetch balance: {exc}")
+        await _reply_plain(message, f"Failed to fetch balance: {exc}")
         return
     await _reply_html(message, format_balance(usdt))
 
@@ -324,7 +335,7 @@ async def fsm_confirm_plan(
     try:
         plan.validate()
     except ValueError as exc:
-        await query.message.answer(f"❌ Plan rejected: {exc}")
+        await _reply_plain(query.message, f"❌ Plan rejected: {exc}")
         await state.clear()
         await query.answer()
         return
@@ -336,7 +347,7 @@ async def fsm_confirm_plan(
         block = await engine.create_block(plan, chat_id=chat_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("create_block failed")
-        await query.message.answer(f"❌ Failed: {exc}")
+        await _reply_plain(query.message, f"❌ Failed: {exc}")
         await state.clear()
         return
 
@@ -389,12 +400,12 @@ async def track_side(
         result = await engine.discover_tracked_orders(symbol=symbol, side=side)
     except Exception as exc:  # noqa: BLE001
         logger.exception("discover_tracked_orders failed")
-        await query.message.answer(f"❌ Could not read orders: {exc}")
+        await _reply_plain(query.message, f"❌ Could not read orders: {exc}")
         await state.clear()
         return
 
     if result.error:
-        await query.message.answer(f"❌ {result.error}")
+        await _reply_plain(query.message, f"❌ {result.error}")
         await state.clear()
         return
 
@@ -499,7 +510,7 @@ async def track_confirm(
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("track_block failed")
-        await query.message.answer(f"❌ Failed: {exc}")
+        await _reply_plain(query.message, f"❌ Failed: {exc}")
         await state.clear()
         return
 
