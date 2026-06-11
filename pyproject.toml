@@ -1,0 +1,70 @@
+[project]
+name = "newstrategybot"
+version = "0.1.0"
+description = "Binance Futures grid-block trading bot with Telegram interface"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "arislanars06-design" }]
+
+dependencies = [
+    # Exchange
+    "python-binance>=1.0.27",
+    # Telegram
+    "aiogram>=3.13.0",
+    # Database
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20.0",
+    "alembic>=1.13.3",
+    # Config
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.1",
+    # Logging
+    "loguru>=0.7.2",
+    # Utils
+    "httpx>=0.27.2",
+    "tenacity>=9.0.0",
+    "tzdata>=2024.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.3",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+    "black>=24.10.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+newstrategybot = "src.main:run"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
