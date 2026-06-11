@@ -16,3 +16,17 @@ class NewBlockFSM(StatesGroup):
     CANCEL_PRICE = State()
     QTY = State()
     CONFIRM = State()
+
+
+class TrackBlockFSM(StatesGroup):
+    """Adopt user-placed orders into a tracked block.
+
+    The bot only needs symbol, side, and cancel price — every other
+    detail (entries, TPs, SLs, quantity) is read from Binance.
+    """
+
+    SYMBOL = State()
+    SIDE = State()
+    DISCOVERED = State()
+    CANCEL_PRICE = State()
+    CONFIRM = State()

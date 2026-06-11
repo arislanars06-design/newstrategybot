@@ -22,6 +22,7 @@ from src.bot.formatters import (
     format_block_summary,
     format_plan_preview,
     format_stats,
+    format_tracker_preview,
 )
 from src.bot.keyboards import (
     CB_CANCEL,
@@ -31,7 +32,7 @@ from src.bot.keyboards import (
     confirm_keyboard,
     side_keyboard,
 )
-from src.bot.states import NewBlockFSM
+from src.bot.states import NewBlockFSM, TrackBlockFSM
 from src.core.engine import BlockEngine
 from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan
 from src.db import BlockSide, repository, session_scope
@@ -73,7 +74,8 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     text = (
         "<b>Commands</b>\n"
-        "/newblock — create a new block (interactive)\n"
+        "/newblock — create a new block (bot places orders)\n"
+        "/track — adopt orders you placed manually on Binance/TV\n"
         "/list — show active blocks\n"
         "/block &lt;id&gt; — block details\n"
         "/cancel &lt;id&gt; — manually close a block\n"
@@ -340,6 +342,169 @@ async def fsm_confirm_plan(
 
     await query.message.answer(
         f"✅ Block <b>#{block.id}</b> placed and active.",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.clear()
+
+
+
+# =============================================================================
+# /track — adopt user-placed orders into a block
+# =============================================================================
+
+
+@router.message(Command("track"))
+async def cmd_track(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(TrackBlockFSM.SYMBOL)
+    await message.answer(
+        "Step 1/3 — send the symbol whose open orders you want to adopt "
+        "(e.g. <code>BTCUSDT</code>).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(TrackBlockFSM.SYMBOL, F.text)
+async def track_symbol(message: Message, state: FSMContext) -> None:
+    symbol = (message.text or "").strip().upper()
+    if not symbol.isalnum() or len(symbol) < 4:
+        await message.answer("Invalid symbol. Try again.")
+        return
+    await state.update_data(symbol=symbol)
+    await state.set_state(TrackBlockFSM.SIDE)
+    await message.answer("Step 2/3 — choose side:", reply_markup=side_keyboard())
+
+
+@router.callback_query(TrackBlockFSM.SIDE, F.data.in_({CB_SIDE_BUY, CB_SIDE_SELL}))
+async def track_side(
+    query: CallbackQuery, state: FSMContext, engine: BlockEngine
+) -> None:
+    side = BlockSide.BUY if query.data == CB_SIDE_BUY else BlockSide.SELL
+    data = await state.get_data()
+    symbol: str = data["symbol"]
+    await query.answer()
+    await query.message.answer("🔍 Reading your open orders from Binance…")
+
+    try:
+        result = await engine.discover_tracked_orders(symbol=symbol, side=side)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("discover_tracked_orders failed")
+        await query.message.answer(f"❌ Could not read orders: {exc}")
+        await state.clear()
+        return
+
+    if result.error:
+        await query.message.answer(f"❌ {result.error}")
+        await state.clear()
+        return
+
+    # Stash the result so the confirm step can persist it without
+    # re-fetching from Binance (which could race with new fills).
+    await state.update_data(
+        side=str(side),
+        rungs=[
+            {
+                "seq": r.seq,
+                "entry_price": r.entry_price,
+                "tp_price": r.tp_price,
+                "sl_price": r.sl_price,
+                "qty": r.qty,
+                "entry_order_id": r.entry_order_id,
+                "tp_order_id": r.tp_order_id,
+                "sl_order_id": r.sl_order_id,
+            }
+            for r in result.rungs
+        ],
+        warnings=result.warnings,
+    )
+
+    await query.message.answer(
+        format_tracker_preview(symbol, side, result),
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(TrackBlockFSM.CANCEL_PRICE)
+    await query.message.answer("Step 3/3 — cancel price?")
+
+
+@router.message(TrackBlockFSM.CANCEL_PRICE, F.text)
+async def track_cancel_price(message: Message, state: FSMContext) -> None:
+    try:
+        cancel_price = float((message.text or "").strip())
+    except ValueError:
+        await message.answer("Send a single number.")
+        return
+
+    data = await state.get_data()
+    side = BlockSide(data["side"])
+    rungs = data["rungs"]
+    symbol = data["symbol"]
+
+    # Sanity-check cancel price against the rungs we just discovered.
+    entries = [r["entry_price"] for r in rungs]
+    if side == BlockSide.BUY and cancel_price <= max(entries):
+        await message.answer(
+            f"❌ For BUY blocks the cancel price must be above the highest "
+            f"entry ({max(entries)})."
+        )
+        return
+    if side == BlockSide.SELL and cancel_price >= min(entries):
+        await message.answer(
+            f"❌ For SELL blocks the cancel price must be below the lowest "
+            f"entry ({min(entries)})."
+        )
+        return
+
+    await state.update_data(cancel_price=cancel_price)
+    await state.set_state(TrackBlockFSM.CONFIRM)
+    await message.answer(
+        f"📋 <b>Confirm tracking</b>\n"
+        f"Symbol: <code>{symbol}</code> <b>{side}</b>\n"
+        f"Rungs: <b>{len(rungs)}</b>\n"
+        f"Cancel price: <code>{cancel_price}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=confirm_keyboard(),
+    )
+
+
+@router.callback_query(TrackBlockFSM.CONFIRM, F.data == CB_CANCEL)
+async def track_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await query.message.answer("Tracking cancelled.")
+    await query.answer()
+
+
+@router.callback_query(TrackBlockFSM.CONFIRM, F.data == CB_CONFIRM)
+async def track_confirm(
+    query: CallbackQuery,
+    state: FSMContext,
+    engine: BlockEngine,
+) -> None:
+    from src.core.tracker import TrackedRung
+
+    data = await state.get_data()
+    chat_id = query.message.chat.id
+
+    rungs = [TrackedRung(**rd) for rd in data["rungs"]]
+
+    await query.answer()
+    await query.message.answer("Adopting orders…")
+
+    try:
+        block = await engine.track_block(
+            symbol=data["symbol"],
+            side=BlockSide(data["side"]),
+            cancel_price=data["cancel_price"],
+            chat_id=chat_id,
+            rungs=rungs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("track_block failed")
+        await query.message.answer(f"❌ Failed: {exc}")
+        await state.clear()
+        return
+
+    await query.message.answer(
+        f"✅ Block <b>#{block.id}</b> is now tracked. Status: ACTIVE",
         parse_mode=ParseMode.HTML,
     )
     await state.clear()

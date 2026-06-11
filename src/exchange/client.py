@@ -291,6 +291,26 @@ class BinanceClient:
                 return False
             raise
 
+    async def cancel_order_by_exchange_id(self, symbol: str, order_id: str) -> bool:
+        """Cancel an order by its Binance ``orderId``.
+
+        Used for tracked (user-placed) orders where we don't control the
+        client order id. Same idempotent semantics as
+        ``cancel_order_by_client_id``.
+        """
+        assert self._client is not None
+        try:
+            await self._client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            return True
+        except BinanceAPIException as exc:
+            if exc.code == -2011:
+                logger.debug(
+                    "cancel_order: orderId={oid} already gone ({msg})",
+                    oid=order_id, msg=exc.message,
+                )
+                return False
+            raise
+
     async def cancel_all_for_symbol(self, symbol: str) -> None:
         """Defensive: cancel every open order for a symbol.
 
@@ -312,3 +332,18 @@ class BinanceClient:
         assert self._client is not None
         data = await self._client.futures_mark_price(symbol=symbol)
         return float(data["markPrice"])
+
+    # ----- Open orders (used by /track) -----
+
+    async def list_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        """Return every currently open order for a Futures symbol.
+
+        The response includes both ordinary LIMIT orders and conditional
+        STOP_MARKET / TAKE_PROFIT(_MARKET) orders. Each dict is the raw
+        Binance payload — callers are expected to inspect ``type``,
+        ``side``, ``positionSide``, ``reduceOnly``, ``price`` and
+        ``stopPrice`` to classify orders.
+        """
+        assert self._client is not None
+        data = await self._client.futures_get_open_orders(symbol=symbol)
+        return list(data) if data else []

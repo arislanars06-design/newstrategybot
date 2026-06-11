@@ -115,6 +115,33 @@ def format_plan_preview(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_tracker_preview(symbol: str, side: Any, result: Any) -> str:
+    """Render the proposed ladder discovered from open Binance orders.
+
+    ``side`` is a BlockSide and ``result`` is a tracker.TrackerResult — kept
+    as ``Any`` here to avoid an import cycle (this module is loaded from
+    handlers.py before src.core.tracker would be ready in some setups).
+    """
+    rungs = result.rungs
+    qty = rungs[0].qty if rungs else 0.0
+    lines = [
+        f"🔍 <b>Discovered ladder</b> — <code>{symbol}</code> <b>{side}</b>",
+        f"Rungs: <b>{len(rungs)}</b>   qty per rung: <code>{qty}</code>",
+        "<pre>",
+        f"{'#':>2} {'entry':>10} {'tp':>10} {'sl':>10}",
+    ]
+    for r in rungs:
+        lines.append(
+            f"{r.seq:>2} {r.entry_price:>10} {r.tp_price:>10} {r.sl_price:>10}"
+        )
+    lines.append("</pre>")
+    if result.warnings:
+        lines.append("")
+        for w in result.warnings:
+            lines.append(f"⚠️ {w}")
+    return "\n".join(lines)
+
+
 # ---------- stats / balance ----------
 
 

@@ -7,7 +7,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from loguru import logger
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -65,8 +67,30 @@ async def init_db() -> None:
 
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _run_lightweight_migrations(conn)
 
     logger.info("Database initialised at {url}", url=_redact_url(url))
+
+
+async def _run_lightweight_migrations(conn: AsyncConnection) -> None:
+    """Idempotent ALTER TABLE patches for SQLite databases created before
+    a column was added. Safe to call on every startup.
+
+    For PostgreSQL we expect Alembic to be used in real deployments, so
+    this helper is a no-op there.
+    """
+    dialect = conn.dialect.name
+    if dialect != "sqlite":
+        return
+
+    # blocks.is_managed — added when /track was introduced.
+    result = await conn.execute(text("PRAGMA table_info(blocks)"))
+    cols = {row[1] for row in result.fetchall()}
+    if "is_managed" not in cols:
+        await conn.execute(
+            text("ALTER TABLE blocks ADD COLUMN is_managed BOOLEAN NOT NULL DEFAULT 1")
+        )
+        logger.info("Migration: added blocks.is_managed column")
 
 
 async def close_db() -> None:

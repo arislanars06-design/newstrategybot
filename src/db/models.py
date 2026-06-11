@@ -53,6 +53,12 @@ class Block(Base):
     # Telegram chat that should receive notifications for this block.
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
+    # True when the bot placed the orders itself (/newblock); False when
+    # the orders were placed by the user manually and the bot only tracks
+    # them (/track). Affects how we cancel orders later (by client_id vs
+    # by exchange order_id).
+    is_managed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
     # Optional human-readable note from the user.
     note: Mapped[str | None] = mapped_column(String(255), nullable=True)
 

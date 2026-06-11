@@ -32,6 +32,7 @@ async def create_block(
     cancel_price: float,
     chat_id: int,
     note: str | None = None,
+    is_managed: bool = True,
 ) -> Block:
     """Create a new Block in CREATED status with no orders attached yet."""
     block = Block(
@@ -41,6 +42,7 @@ async def create_block(
         cancel_price=cancel_price,
         cancel_price_active=True,
         chat_id=chat_id,
+        is_managed=is_managed,
         note=note,
     )
     session.add(block)
@@ -124,8 +126,22 @@ async def add_order(
     tp_price: float,
     sl_price: float,
     qty: float,
+    client_id_prefix: str = "blk",
+    entry_order_id: str | None = None,
+    tp_order_id: str | None = None,
+    sl_order_id: str | None = None,
 ) -> Order:
-    """Attach a new order row to a block. State starts as PENDING."""
+    """Attach a new order row to a block.
+
+    ``client_id_prefix`` is "blk" for managed orders (we will use it as
+    the actual Binance client_order_id when placing) and "trk" for
+    tracked orders (where it is just a synthetic value to satisfy the
+    NOT NULL + UNIQUE constraint — Binance never sees it).
+
+    Pass ``entry_order_id`` / ``tp_order_id`` / ``sl_order_id`` for
+    tracked orders so the engine can route incoming WebSocket events to
+    this row immediately.
+    """
     order = Order(
         block_id=block_id,
         seq=seq,
@@ -133,9 +149,12 @@ async def add_order(
         tp_price=tp_price,
         sl_price=sl_price,
         qty=qty,
-        entry_client_id=f"blk{block_id}-s{seq}-e",
-        tp_client_id=f"blk{block_id}-s{seq}-t",
-        sl_client_id=f"blk{block_id}-s{seq}-l",
+        entry_client_id=f"{client_id_prefix}{block_id}-s{seq}-e",
+        tp_client_id=f"{client_id_prefix}{block_id}-s{seq}-t",
+        sl_client_id=f"{client_id_prefix}{block_id}-s{seq}-l",
+        entry_order_id=entry_order_id,
+        tp_order_id=tp_order_id,
+        sl_order_id=sl_order_id,
     )
     session.add(order)
     await session.flush()
@@ -156,6 +175,60 @@ async def get_order_by_client_id(
         | (Order.sl_client_id == client_id)
     )
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def find_order_and_kind_by_exchange_id(
+    session: AsyncSession, order_id: str
+) -> tuple[Order, str] | None:
+    """Look up an order by its Binance ``orderId`` and report which slot it filled.
+
+    Returns ``(order, kind)`` where ``kind`` is one of ``"e"`` (entry),
+    ``"t"`` (take-profit), or ``"l"`` (stop-loss). Returns ``None`` when
+    no matching order is found — typically because the event refers to
+    an order placed outside our blocks.
+    """
+    stmt = select(Order).where(
+        (Order.entry_order_id == order_id)
+        | (Order.tp_order_id == order_id)
+        | (Order.sl_order_id == order_id)
+    )
+    order = (await session.execute(stmt)).scalar_one_or_none()
+    if order is None:
+        return None
+    if order.entry_order_id == order_id:
+        return order, "e"
+    if order.tp_order_id == order_id:
+        return order, "t"
+    if order.sl_order_id == order_id:
+        return order, "l"
+    return None  # pragma: no cover — unreachable given the WHERE clause
+
+
+async def get_assigned_exchange_order_ids(
+    session: AsyncSession, *, symbol: str
+) -> set[str]:
+    """Return every Binance order_id that is currently assigned to an
+    active block on the given symbol.
+
+    Used by ``/track`` to filter out orders that already belong to an
+    existing block, so the user can adopt only fresh orders.
+    """
+    stmt = (
+        select(Order.entry_order_id, Order.tp_order_id, Order.sl_order_id)
+        .join(Block, Block.id == Order.block_id)
+        .where(Block.symbol == symbol)
+        .where(Block.status.in_([BlockStatus.CREATED, BlockStatus.ACTIVE]))
+    )
+    rows = (await session.execute(stmt)).all()
+    assigned: set[str] = set()
+    for entry_id, tp_id, sl_id in rows:
+        if entry_id:
+            assigned.add(str(entry_id))
+        if tp_id:
+            assigned.add(str(tp_id))
+        if sl_id:
+            assigned.add(str(sl_id))
+    return assigned
 
 
 async def get_pending_orders_for_block(

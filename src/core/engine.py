@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import Settings
 from src.core.notifications import Notification, NotificationHandler, NotificationType
-from src.core.plan import BlockPlan
+from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan
 from src.db import (
     Block,
     BlockSide,
@@ -128,6 +128,109 @@ class BlockEngine:
 
     # ----- Public API -----
 
+    async def discover_tracked_orders(
+        self, *, symbol: str, side: BlockSide
+    ):
+        """Read open orders from Binance and group them into a candidate block.
+
+        Pure inspection: nothing is persisted. The caller (Telegram
+        handler) shows the result to the user for confirmation, then
+        calls :meth:`track_block` if accepted.
+        """
+        from src.core.tracker import discover_block as _discover
+
+        open_orders = await self._client.list_open_orders(symbol)
+        async with session_scope() as session:
+            assigned = await repository.get_assigned_exchange_order_ids(
+                session, symbol=symbol
+            )
+        return _discover(
+            open_orders, side=side, assigned_order_ids=assigned
+        )
+
+    async def track_block(
+        self,
+        *,
+        symbol: str,
+        side: BlockSide,
+        cancel_price: float,
+        chat_id: int,
+        rungs,  # list[TrackedRung]
+        note: str | None = None,
+    ) -> Block:
+        """Adopt user-placed Binance orders as a new block.
+
+        Unlike :meth:`create_block`, no orders are sent to the exchange.
+        We only persist the block + 8 orders (with their existing
+        Binance order IDs) and start watching them.
+        """
+        if len(rungs) != EXPECTED_ORDERS_PER_BLOCK:
+            raise ValueError(
+                f"track_block requires exactly {EXPECTED_ORDERS_PER_BLOCK} rungs"
+            )
+
+        async with session_scope() as session:
+            block = await repository.create_block(
+                session,
+                symbol=symbol,
+                side=side,
+                cancel_price=cancel_price,
+                chat_id=chat_id,
+                note=note,
+                is_managed=False,
+            )
+            for rung in rungs:
+                await repository.add_order(
+                    session,
+                    block_id=block.id,
+                    seq=rung.seq,
+                    entry_price=rung.entry_price,
+                    tp_price=rung.tp_price,
+                    sl_price=rung.sl_price,
+                    qty=rung.qty,
+                    client_id_prefix="trk",
+                    entry_order_id=rung.entry_order_id,
+                    tp_order_id=rung.tp_order_id,
+                    sl_order_id=rung.sl_order_id,
+                )
+            await repository.add_event(
+                session,
+                block_id=block.id,
+                event_type=EventType.BLOCK_CREATED,
+                payload={
+                    "symbol": symbol,
+                    "side": str(side),
+                    "cancel_price": cancel_price,
+                    "tracked": True,
+                },
+            )
+            await repository.update_block_status(session, block, BlockStatus.ACTIVE)
+            await repository.add_event(
+                session,
+                block_id=block.id,
+                event_type=EventType.ORDERS_PLACED,
+                payload={"tracked": True},
+            )
+            block_id = block.id
+
+        await self._mark_stream.add_symbol(symbol)
+
+        await self._notify(
+            type_=NotificationType.BLOCK_CREATED,
+            block_id=block_id,
+            chat_id=chat_id,
+            payload={
+                "symbol": symbol,
+                "side": str(side),
+                "orders": len(rungs),
+                "cancel_price": cancel_price,
+                "tracked": True,
+            },
+        )
+
+        async with session_scope() as session:
+            return await repository.get_block(session, block_id)
+
     async def create_block(self, plan: BlockPlan, chat_id: int) -> Block:
         """Validate, persist, and place the entry orders for a new block.
 
@@ -147,6 +250,7 @@ class BlockEngine:
                 cancel_price=plan.cancel_price,
                 chat_id=chat_id,
                 note=plan.note,
+                is_managed=True,
             )
             for spec in plan.orders:
                 await repository.add_order(
@@ -235,15 +339,32 @@ class BlockEngine:
     # ----- WebSocket handlers -----
 
     async def _handle_order_update(self, update: OrderUpdate) -> None:
-        """Entry point for every ORDER_TRADE_UPDATE event."""
-        parsed = _parse_client_id(update.client_order_id)
-        if parsed is None:
-            # Not one of our orders — ignore (e.g. manual exchange order).
-            return
+        """Entry point for every ORDER_TRADE_UPDATE event.
 
+        Matching strategy:
+
+        1. If the client_order_id parses as one we generated (managed
+           blocks created via /newblock), use it directly — it carries
+           block_id and seq, so the lookup is O(1) and works even
+           before we have persisted the exchange order_id.
+        2. Otherwise (tracked blocks, or any race where the client_id
+           shortcut is unavailable) fall back to looking up by the
+           Binance ``orderId`` against entry/tp/sl_order_id columns.
+        """
+        parsed = _parse_client_id(update.client_order_id)
+        if parsed is not None:
+            await self._dispatch_with_lock_managed(parsed, update)
+            return
+        await self._dispatch_with_lock_tracked(update)
+
+    async def _dispatch_with_lock_managed(
+        self, parsed: _ParsedClientId, update: OrderUpdate
+    ) -> None:
         async with self._lock_for(parsed.block_id):
             try:
-                await self._dispatch_order_update(parsed, update)
+                await self._dispatch_order_update(
+                    block_id=parsed.block_id, seq=parsed.seq, kind=parsed.kind, update=update
+                )
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "order-update dispatch failed for block={b} seq={s} kind={k}",
@@ -252,30 +373,61 @@ class BlockEngine:
                     k=parsed.kind,
                 )
 
+    async def _dispatch_with_lock_tracked(self, update: OrderUpdate) -> None:
+        if not update.order_id:
+            return
+        # Resolve outside the per-block lock so we know which block to
+        # lock; then re-fetch under the lock for atomicity.
+        async with session_scope() as session:
+            found = await repository.find_order_and_kind_by_exchange_id(
+                session, update.order_id
+            )
+        if found is None:
+            return  # not one of our orders
+        order, kind = found
+        block_id = order.block_id
+        seq = order.seq
+
+        async with self._lock_for(block_id):
+            try:
+                await self._dispatch_order_update(
+                    block_id=block_id, seq=seq, kind=kind, update=update
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "order-update dispatch failed for tracked block={b} seq={s} kind={k}",
+                    b=block_id, s=seq, k=kind,
+                )
+
     async def _dispatch_order_update(
-        self, parsed: _ParsedClientId, update: OrderUpdate
+        self,
+        *,
+        block_id: int,
+        seq: int,
+        kind: str,
+        update: OrderUpdate,
     ) -> None:
         if not (update.is_filled or update.is_canceled):
             # Intermediate states (NEW, PARTIALLY_FILLED) — ignore.
             return
 
         async with session_scope() as session:
-            block = await repository.get_block(session, parsed.block_id)
+            block = await repository.get_block(session, block_id)
             if block is None or block.is_terminal:
                 return
-            order = next((o for o in block.orders if o.seq == parsed.seq), None)
+            order = next((o for o in block.orders if o.seq == seq), None)
             if order is None:
                 return
 
-            if parsed.kind == "e":
+            if kind == "e":
                 if update.is_filled:
                     await self._on_entry_filled(session, block, order, update)
                 elif update.is_canceled:
                     await self._on_entry_canceled(session, block, order, update)
-            elif parsed.kind == "t":
+            elif kind == "t":
                 if update.is_filled:
                     await self._on_tp_filled(session, block, order, update)
-            elif parsed.kind == "l":
+            elif kind == "l":
                 if update.is_filled:
                     await self._on_sl_filled(session, block, order, update)
 
@@ -417,14 +569,7 @@ class BlockEngine:
         )
 
         # Cancel the now-orphan SL for the same rung.
-        if order.sl_client_id:
-            try:
-                await self._client.cancel_order_by_client_id(block.symbol, order.sl_client_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Could not cancel SL for block={b} seq={s}: {err}",
-                    b=block.id, s=order.seq, err=exc,
-                )
+        await self._cancel_one_order(block, order, "l")
 
         # Block becomes WIN: cancel every pending entry. Open positions
         # from already-triggered orders (Variant A) keep their own
@@ -491,14 +636,7 @@ class BlockEngine:
         )
 
         # The TP for this rung is now an orphan reduce-only — cancel it.
-        if order.tp_client_id:
-            try:
-                await self._client.cancel_order_by_client_id(block.symbol, order.tp_client_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Could not cancel TP for block={b} seq={s}: {err}",
-                    b=block.id, s=order.seq, err=exc,
-                )
+        await self._cancel_one_order(block, order, "t")
 
         await self._notify(
             type_=NotificationType.SL_HIT,
@@ -665,15 +803,7 @@ class BlockEngine:
     ) -> None:
         pendings = [o for o in block.orders if o.state == OrderState.PENDING]
         for order in pendings:
-            try:
-                await self._client.cancel_order_by_client_id(
-                    block.symbol, order.entry_client_id
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Cancel pending entry failed (block={b} seq={s}): {err}",
-                    b=block.id, s=order.seq, err=exc,
-                )
+            await self._cancel_one_order(block, order, "e")
             await repository.update_order_state(session, order, OrderState.CANCELLED)
             await repository.add_event(
                 session,
@@ -688,14 +818,8 @@ class BlockEngine:
     ) -> None:
         """Cancel every order owned by this block (defensive close)."""
         for order in block.orders:
-            for cid in (order.entry_client_id, order.tp_client_id, order.sl_client_id):
-                try:
-                    await self._client.cancel_order_by_client_id(block.symbol, cid)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "cancel {cid} failed (likely already gone): {err}",
-                        cid=cid, err=exc,
-                    )
+            for kind in ("e", "t", "l"):
+                await self._cancel_one_order(block, order, kind)
             if order.state == OrderState.PENDING:
                 await repository.update_order_state(session, order, OrderState.CANCELLED)
                 await repository.add_event(
@@ -705,6 +829,48 @@ class BlockEngine:
                     event_type=EventType.ORDER_CANCELLED,
                     payload={"reason": "block_terminal"},
                 )
+
+    async def _cancel_one_order(
+        self, block: Block, order: Order, kind: str
+    ) -> bool:
+        """Cancel a single child order, picking the right identifier.
+
+        Managed blocks (placed by /newblock) always carry a predictable
+        client_order_id, so we cancel by client_id. Tracked blocks
+        (adopted via /track) have arbitrary user-defined client IDs, so
+        we cancel by Binance ``orderId`` instead.
+        """
+        if kind == "e":
+            client_id = order.entry_client_id
+            exchange_id = order.entry_order_id
+        elif kind == "t":
+            client_id = order.tp_client_id
+            exchange_id = order.tp_order_id
+        elif kind == "l":
+            client_id = order.sl_client_id
+            exchange_id = order.sl_order_id
+        else:
+            return False
+
+        try:
+            if block.is_managed and client_id:
+                return await self._client.cancel_order_by_client_id(
+                    block.symbol, client_id
+                )
+            if exchange_id:
+                return await self._client.cancel_order_by_exchange_id(
+                    block.symbol, exchange_id
+                )
+            if client_id:
+                return await self._client.cancel_order_by_client_id(
+                    block.symbol, client_id
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "cancel failed (block={b} seq={s} kind={k}): {err}",
+                b=block.id, s=order.seq, k=kind, err=exc,
+            )
+        return False
 
     async def _mark_block_error(self, block_id: int, reason: str) -> None:
         async with session_scope() as session:
