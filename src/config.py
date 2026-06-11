@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     telegram_allowed_user_ids: str = Field(default="")
     telegram_notify_chat_id: int = Field(...)
 
+    # Optional public/private channel that receives a copy of important
+    # block-level events (BLOCK_CREATED, BLOCK_WIN, BLOCK_LOSS,
+    # BLOCK_INVALID, BLOCK_ERROR). Use the negative numeric ID Telegram
+    # assigns to channels (e.g. -1001234567890). Leave empty to disable.
+    telegram_notify_channel_id: int | None = None
+
     # --- Database ---
     database_url: str = "sqlite+aiosqlite:///./data/newstrategybot.db"
 

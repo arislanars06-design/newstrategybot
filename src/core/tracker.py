@@ -132,124 +132,145 @@ def discover_block(
             ),
         )
 
-    # 4. Sort entries: BUY ladder descends (100, 99, ...), SELL ascends.
+    # 4. Group entries / TPs / SLs by quantity. The user is allowed to
+    #    pick a different size per rung (different risk per order) so
+    #    we cannot assume one global qty. Within each qty bucket we
+    #    sort by price and pair index-wise — this keeps ladder offsets
+    #    intact while supporting the simple all-same-qty case as a
+    #    degenerate one-bucket scenario.
     descending = side == BlockSide.BUY
-    entries.sort(key=lambda o: float(o["price"]), reverse=descending)
 
-    # 5. Verify all entries share the same quantity (the strategy assumes it).
-    qtys = {round(float(o["origQty"]), 10) for o in entries}
-    if len(qtys) > 1:
-        return TrackerResult(
-            rungs=[],
-            warnings=[],
-            error=(
-                "Entry orders have mixed quantities. The strategy expects "
-                "all 8 rungs to share the same size. Detected quantities: "
-                f"{sorted(qtys)}."
-            ),
-        )
-    entry_qty = float(entries[0]["origQty"])
+    qty_buckets: dict[float, dict[str, list[dict[str, Any]]]] = {}
 
-    # 6. Filter TPs / SLs to the matching quantity, then sort them in the
-    #    same order as the entries so the i-th entry pairs with the i-th
-    #    TP/SL. This handles the natural "ladder" case (each rung has
-    #    the same offset) far better than greedy nearest-price pairing,
-    #    which mis-assigns rungs when TP intervals overlap.
-    qty_tps = [tp for tp in tps if _qty_close(float(tp.get("origQty", 0)), entry_qty)]
-    qty_sls = [sl for sl in sls if _qty_close(float(sl.get("origQty", 0)), entry_qty)]
+    def _bucket(qty_key: float) -> dict[str, list[dict[str, Any]]]:
+        return qty_buckets.setdefault(qty_key, {"entries": [], "tps": [], "sls": []})
 
-    if len(qty_tps) < expected_rungs:
-        return TrackerResult(
-            rungs=[], warnings=[],
-            error=(
-                f"Need {expected_rungs} TP orders with qty={entry_qty}, "
-                f"found {len(qty_tps)}."
-            ),
-        )
-    if len(qty_sls) < expected_rungs:
-        return TrackerResult(
-            rungs=[], warnings=[],
-            error=(
-                f"Need {expected_rungs} SL orders with qty={entry_qty}, "
-                f"found {len(qty_sls)}."
-            ),
-        )
-
-    qty_tps.sort(key=_tp_price_of, reverse=descending)
-    qty_sls.sort(key=_sl_price_of, reverse=descending)
-
-    # If there are extras at the same qty, they belong to other (yet to
-    # be confirmed) blocks — keep only the first 8 in the sorted order.
-    paired_tps = qty_tps[:expected_rungs]
-    paired_sls = qty_sls[:expected_rungs]
+    for e in entries:
+        _bucket(_qty_key(e.get("origQty", 0)))["entries"].append(e)
+    for t in tps:
+        _bucket(_qty_key(t.get("origQty", 0)))["tps"].append(t)
+    for s in sls:
+        _bucket(_qty_key(s.get("origQty", 0)))["sls"].append(s)
 
     rungs: list[TrackedRung] = []
-    for seq, (entry, tp, sl) in enumerate(
-        zip(entries, paired_tps, paired_sls, strict=True), start=1
-    ):
-        entry_price = float(entry["price"])
-        tp_price = _tp_price_of(tp)
-        sl_price = _sl_price_of(sl)
 
-        # Validate the side constraint per-rung. If the user placed
-        # orders that don't form a coherent ladder, surface the problem
-        # early instead of silently mis-pairing.
-        if side == BlockSide.BUY:
-            if tp_price <= entry_price:
-                return TrackerResult(
-                    rungs=[], warnings=[],
-                    error=(
-                        f"BUY rung {seq}: TP {tp_price} is not above entry "
-                        f"{entry_price}. Re-check your order layout."
-                    ),
-                )
-            if sl_price >= entry_price:
-                return TrackerResult(
-                    rungs=[], warnings=[],
-                    error=(
-                        f"BUY rung {seq}: SL {sl_price} is not below entry "
-                        f"{entry_price}."
-                    ),
-                )
-        else:
-            if tp_price >= entry_price:
-                return TrackerResult(
-                    rungs=[], warnings=[],
-                    error=(
-                        f"SELL rung {seq}: TP {tp_price} is not below entry "
-                        f"{entry_price}."
-                    ),
-                )
-            if sl_price <= entry_price:
-                return TrackerResult(
-                    rungs=[], warnings=[],
-                    error=(
-                        f"SELL rung {seq}: SL {sl_price} is not above entry "
-                        f"{entry_price}."
-                    ),
-                )
+    # Process buckets in a deterministic order (largest qty first feels
+    # natural but is purely cosmetic; final rungs are re-sorted below).
+    for qty_key in sorted(qty_buckets.keys(), reverse=True):
+        bucket = qty_buckets[qty_key]
+        bucket_entries = bucket["entries"]
+        if not bucket_entries:
+            continue  # qty appears only on a TP/SL — irrelevant by itself.
 
-        rungs.append(
-            TrackedRung(
-                seq=seq,
-                entry_price=entry_price,
-                tp_price=tp_price,
-                sl_price=sl_price,
-                qty=entry_qty,
-                entry_order_id=str(entry["orderId"]),
-                tp_order_id=str(tp["orderId"]),
-                sl_order_id=str(sl["orderId"]),
+        sorted_entries = sorted(
+            bucket_entries, key=lambda o: float(o["price"]), reverse=descending
+        )
+        bucket_tps = sorted(bucket["tps"], key=_tp_price_of, reverse=descending)
+        bucket_sls = sorted(bucket["sls"], key=_sl_price_of, reverse=descending)
+
+        if len(bucket_tps) < len(sorted_entries):
+            return TrackerResult(
+                rungs=[], warnings=[],
+                error=(
+                    f"Quantity bucket {qty_key}: need {len(sorted_entries)} "
+                    f"TP order(s) at this size, found {len(bucket_tps)}."
+                ),
             )
+        if len(bucket_sls) < len(sorted_entries):
+            return TrackerResult(
+                rungs=[], warnings=[],
+                error=(
+                    f"Quantity bucket {qty_key}: need {len(sorted_entries)} "
+                    f"SL order(s) at this size, found {len(bucket_sls)}."
+                ),
+            )
+
+        # Pair index-wise; extras at this qty go back to the pool but
+        # since we partition by qty there is no other consumer here.
+        for entry, tp, sl in zip(
+            sorted_entries,
+            bucket_tps[: len(sorted_entries)],
+            bucket_sls[: len(sorted_entries)],
+            strict=True,
+        ):
+            entry_price = float(entry["price"])
+            tp_price = _tp_price_of(tp)
+            sl_price = _sl_price_of(sl)
+
+            if side == BlockSide.BUY:
+                if tp_price <= entry_price:
+                    return TrackerResult(
+                        rungs=[], warnings=[],
+                        error=(
+                            f"BUY rung at {entry_price}: TP {tp_price} must "
+                            "be above entry."
+                        ),
+                    )
+                if sl_price >= entry_price:
+                    return TrackerResult(
+                        rungs=[], warnings=[],
+                        error=(
+                            f"BUY rung at {entry_price}: SL {sl_price} must "
+                            "be below entry."
+                        ),
+                    )
+            else:
+                if tp_price >= entry_price:
+                    return TrackerResult(
+                        rungs=[], warnings=[],
+                        error=(
+                            f"SELL rung at {entry_price}: TP {tp_price} must "
+                            "be below entry."
+                        ),
+                    )
+                if sl_price <= entry_price:
+                    return TrackerResult(
+                        rungs=[], warnings=[],
+                        error=(
+                            f"SELL rung at {entry_price}: SL {sl_price} must "
+                            "be above entry."
+                        ),
+                    )
+
+            rungs.append(
+                TrackedRung(
+                    seq=0,  # renumbered below after we sort by price
+                    entry_price=entry_price,
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    qty=float(entry["origQty"]),
+                    entry_order_id=str(entry["orderId"]),
+                    tp_order_id=str(tp["orderId"]),
+                    sl_order_id=str(sl["orderId"]),
+                )
+            )
+
+    if len(rungs) != expected_rungs:
+        return TrackerResult(
+            rungs=[], warnings=[],
+            error=(
+                f"Could only pair {len(rungs)} rung(s); expected "
+                f"{expected_rungs}. Make sure every entry has a matching "
+                "TP and SL with the same quantity."
+            ),
         )
 
-    # 7. Surface warnings about leftover unmatched TP/SL orders.
+    # 5. Sort the final ladder by entry price (descending for BUY,
+    #    ascending for SELL) and assign seq numbers 1..N.
+    rungs.sort(key=lambda r: r.entry_price, reverse=descending)
+    for i, rung in enumerate(rungs, start=1):
+        rung.seq = i
+
+    # 6. Surface warnings about leftover unmatched TP/SL orders.
+    used_tp_ids = {r.tp_order_id for r in rungs}
+    used_sl_ids = {r.sl_order_id for r in rungs}
+    leftover_tp = sum(1 for t in tps if str(t["orderId"]) not in used_tp_ids)
+    leftover_sl = sum(1 for s in sls if str(s["orderId"]) not in used_sl_ids)
     warnings: list[str] = []
-    leftover_tp = len(qty_tps) - expected_rungs
-    leftover_sl = len(qty_sls) - expected_rungs
     if leftover_tp:
-        warnings.append(f"{leftover_tp} extra TP order(s) with same qty ignored.")
+        warnings.append(f"{leftover_tp} extra TP order(s) ignored.")
     if leftover_sl:
-        warnings.append(f"{leftover_sl} extra SL order(s) with same qty ignored.")
+        warnings.append(f"{leftover_sl} extra SL order(s) ignored.")
 
     return TrackerResult(rungs=rungs, warnings=warnings)
 
@@ -311,3 +332,13 @@ def _sl_price_of(order: dict[str, Any]) -> float:
 def _qty_close(a: float, b: float, tol: float = 1e-8) -> bool:
     """Float-tolerant equality for quantities."""
     return abs(a - b) <= tol * max(abs(a), abs(b), 1.0)
+
+
+def _qty_key(qty: Any) -> float:
+    """Bucketing key for grouping orders by quantity.
+
+    Crypto exchanges report quantities with up to 8 decimal places. We
+    round at 1e-8 so cosmetic floating-point noise (e.g. 0.0010000001)
+    doesn't accidentally split otherwise-identical buckets.
+    """
+    return round(float(qty), 8)

@@ -55,7 +55,12 @@ async def _amain() -> int:
     # 3. Telegram bot — Notifier needs the bot instance, the engine needs
     #    the notifier callback, the dispatcher needs the engine and client.
     bot = build_bot(settings)
-    notifier = TelegramNotifier(bot)
+    notifier = TelegramNotifier(bot, channel_id=settings.telegram_notify_channel_id)
+    if settings.telegram_notify_channel_id is not None:
+        logger.info(
+            "Channel mirroring enabled for block events (channel_id={cid})",
+            cid=settings.telegram_notify_channel_id,
+        )
     engine = BlockEngine(
         settings=settings,
         client=client,
