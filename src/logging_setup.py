@@ -20,6 +20,10 @@ def configure_logging(settings: Settings) -> None:
     logger.remove()
 
     # Console sink — coloured, human-friendly.
+    # NOTE: enqueue=False — the bot is single-process asyncio, so we don't
+    # need the multiprocessing queue. enqueue=True breaks when log records
+    # carry non-picklable objects (e.g. aiohttp CIMultiDictProxy inside
+    # BinanceAPIException), so we avoid it.
     logger.add(
         sys.stderr,
         level=settings.log_level,
@@ -31,7 +35,7 @@ def configure_logging(settings: Settings) -> None:
         ),
         backtrace=True,
         diagnose=False,  # do not leak variable values into logs
-        enqueue=True,
+        enqueue=False,
     )
 
     # File sink — rotating, structured for grep / journald.
@@ -44,7 +48,7 @@ def configure_logging(settings: Settings) -> None:
         retention="14 days",
         compression="zip",
         encoding="utf-8",
-        enqueue=True,
+        enqueue=False,
         format=(
             "{time:YYYY-MM-DD HH:mm:ss.SSS} "
             "| {level: <8} "

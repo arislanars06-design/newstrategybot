@@ -130,7 +130,10 @@ class BinanceClient:
     async def ensure_hedge_mode(self) -> bool:
         """Enable Hedge Mode (dual-side positions) if not already active.
 
-        Returns True if hedge mode is active after the call.
+        Returns True if hedge mode is active after the call. If the
+        exchange refuses because there are existing open orders or
+        positions (-4067), we log a clear message instructing the user
+        how to recover and return False without attempting again.
         """
         assert self._client is not None
         current = await self._client.futures_get_position_mode()
@@ -139,10 +142,22 @@ class BinanceClient:
         try:
             await self._client.futures_change_position_mode(dualSidePosition="true")
         except BinanceAPIException as exc:
-            # -4059 = "No need to change position side" — already in hedge mode.
+            # -4059: "No need to change position side" — already in hedge mode.
             if exc.code == -4059:
                 return True
-            logger.error("Failed to enable hedge mode: {err}", err=exc)
+            # -4067: open orders / positions block the change.
+            if exc.code == -4067:
+                logger.error(
+                    "Cannot enable Hedge Mode: existing open orders or "
+                    "positions block the change. Cancel all open orders and "
+                    "close all positions in the Binance Futures UI, or "
+                    "switch Position Mode to Hedge manually, then restart "
+                    "the bot."
+                )
+                return False
+            # Convert the exception to a plain string so loguru does not
+            # try to pickle the underlying aiohttp response object.
+            logger.error("Failed to enable hedge mode: {msg}", msg=str(exc))
             return False
         return True
 
