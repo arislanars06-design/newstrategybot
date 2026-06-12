@@ -1,15 +1,22 @@
-"""Message formatting helpers — keep handlers focused on flow logic."""
+"""Message formatting helpers — keep handlers focused on flow logic.
+
+Most formatters return Telegram-ready HTML. The few that contain raw
+user-supplied content (block notes) escape it explicitly so the parser
+never trips on accidental ``<`` / ``>`` characters.
+"""
 
 from __future__ import annotations
 
+from html import escape as _h
 from typing import Any
 
 from src.core.notifications import Notification, NotificationType
+from src.core.risk import order_risk_amount, total_block_risk
 from src.db import Block, Order
 from src.db.enums import BlockSide, BlockStatus, OrderState
 
 
-# ---------- block / order rendering ----------
+# ---------- emoji mappings ----------
 
 
 def _status_emoji(status: BlockStatus) -> str:
@@ -18,24 +25,39 @@ def _status_emoji(status: BlockStatus) -> str:
         BlockStatus.ACTIVE: "🟡",
         BlockStatus.WIN: "🟢",
         BlockStatus.LOSS: "🔴",
-        BlockStatus.INVALID: "⚠️",
+        BlockStatus.INVALID: "⚫",
         BlockStatus.ERROR: "🚨",
     }.get(status, "•")
 
 
-def _order_state_emoji(state: OrderState) -> str:
-    return {
-        OrderState.PENDING: "⏳",
-        OrderState.TRIGGERED: "📍",
-        OrderState.TP_HIT: "🟢",
-        OrderState.SL_HIT: "🔴",
-        OrderState.CANCELLED: "🚫",
-        OrderState.ERROR: "🚨",
-    }.get(state, "•")
+# Short tag the user wants in the per-rung list ("1/8 SL"). The
+# trader's vocabulary is slightly different from the engine's:
+# TRIGGERED (the position is open and waiting on its TP/SL) reads as
+# "ACTIVE" in their world, while a CREATED-but-not-yet-placed rung
+# reads as "PENDING".
+_ORDER_STATE_LABEL: dict[OrderState, str] = {
+    OrderState.PENDING: "PENDING",
+    OrderState.TRIGGERED: "ACTIVE",
+    OrderState.TP_HIT: "TP",
+    OrderState.SL_HIT: "SL",
+    OrderState.CANCELLED: "CANCEL",
+    OrderState.ERROR: "ERROR",
+}
+
+
+def _signed(amount: float, places: int = 2) -> str:
+    """Render a number with an explicit +/- sign."""
+    sign = "+" if amount >= 0 else ""
+    return f"{sign}{round(amount, places)}"
+
+
+# =============================================================================
+# Block / order rendering
+# =============================================================================
 
 
 def format_block_summary(block: Block) -> str:
-    """Single-line summary used in lists."""
+    """Single-line summary used in the /list response."""
     return (
         f"{_status_emoji(block.status)} #{block.id} "
         f"{block.symbol} {block.side} "
@@ -44,50 +66,109 @@ def format_block_summary(block: Block) -> str:
     )
 
 
-def format_block_detail(block: Block) -> str:
-    """Detailed multi-line view for ``/block <id>``."""
+def format_block_detail(
+    block: Block, *, realtime_pnl: dict[str, Any] | None = None
+) -> str:
+    """Detailed multi-line view for ``/block <id>``.
+
+    The layout matches the spec the trader requested:
+
+        Block #15
+        BTCUSDT BUY
+        Status: ACTIVE
+
+        Orders:
+        1/8 SL
+        2/8 ACTIVE
+        ...
+
+        Current PNL: +12.5$
+
+    ``realtime_pnl`` is the dict returned by
+    :meth:`BlockEngine.compute_block_realtime_pnl`. When the block is
+    in a terminal state we fall back to the persisted ``net_pnl``.
+    """
+    total = len(block.orders)
     lines: list[str] = [
-        f"{_status_emoji(block.status)} <b>BLOCK #{block.id}</b> — "
+        f"{_status_emoji(block.status)} <b>BLOCK #{block.id}</b>",
         f"<code>{block.symbol}</code> <b>{block.side}</b>",
         f"Status: <b>{block.status}</b>",
-        f"Cancel price: <code>{block.cancel_price}</code> "
-        f"({'active' if block.cancel_price_active else 'inactive'})",
-        f"Created: <code>{block.created_at:%Y-%m-%d %H:%M UTC}</code>",
     ]
+
     if block.note:
-        lines.append(f"Note: <i>{block.note}</i>")
+        lines.append(f"Note: <i>{_h(block.note)}</i>")
+
+    # Cancel-price / win-rung header — small, only shown when meaningful.
+    cp_state = "active" if block.cancel_price_active else "off"
+    lines.append(f"Cancel price: <code>{block.cancel_price}</code> ({cp_state})")
     if block.win_order_seq is not None:
         lines.append(f"Winning rung: <b>#{block.win_order_seq}</b>")
-    if block.net_pnl is not None:
-        sign = "+" if block.net_pnl >= 0 else ""
-        lines.append(f"Net P&amp;L: <b>{sign}{block.net_pnl}</b>")
+
+    # Spec-shaped order list.
+    lines.append("")
+    lines.append("<b>Orders:</b>")
+    sorted_orders = sorted(block.orders, key=lambda o: o.seq)
+    for o in sorted_orders:
+        label = _ORDER_STATE_LABEL.get(o.state, str(o.state))
+        risk = order_risk_amount(
+            side=block.side,
+            entry_price=o.entry_price,
+            sl_price=o.sl_price,
+            qty=o.qty,
+        )
+        pnl_part = ""
+        if o.pnl is not None:
+            pnl_part = f"  pnl {_signed(o.pnl, 4)}"
+        lines.append(
+            f"<code>{o.seq}/{total}</code> <b>{label}</b>"
+            f"  entry <code>{o.entry_price}</code>"
+            f"  TP <code>{o.tp_price}</code>"
+            f"  SL <code>{o.sl_price}</code>"
+            f"  qty <code>{o.qty}</code>"
+            f"  risk <code>{round(risk, 4)}</code>"
+            f"{pnl_part}"
+        )
+
+    # Risk + PnL summary block.
+    lines.append("")
+    block_risk = total_block_risk(
+        side=block.side,
+        rungs=((o.entry_price, o.sl_price, o.qty) for o in sorted_orders),
+    )
+    lines.append(f"Block risk (max loss): <code>{block_risk}</code>")
+
+    if block.is_terminal and block.net_pnl is not None:
+        lines.append(f"Net PnL: <b>{_signed(block.net_pnl, 4)}</b>")
+    elif realtime_pnl is not None:
+        unr = realtime_pnl.get("unrealised")
+        if unr is None:
+            lines.append(
+                f"Realised PnL: <b>{_signed(realtime_pnl['realised'], 4)}</b>"
+                "  (mark price unavailable)"
+            )
+        else:
+            lines.append(
+                f"Current PnL: <b>{_signed(realtime_pnl['total'], 4)}</b>"
+                f"  (realised {_signed(realtime_pnl['realised'], 4)},"
+                f" unrealised {_signed(unr, 4)})"
+            )
+            if realtime_pnl.get("mark_price") is not None:
+                lines.append(
+                    f"Mark price: <code>{realtime_pnl['mark_price']}</code>"
+                    f"  open positions: <b>{realtime_pnl['open_count']}</b>"
+                )
+
+    lines.append("")
+    lines.append(f"Created: <code>{block.created_at:%Y-%m-%d %H:%M UTC}</code>")
     if block.closed_at is not None:
         lines.append(f"Closed: <code>{block.closed_at:%Y-%m-%d %H:%M UTC}</code>")
 
-    lines.append("")
-    lines.append("<b>Orders:</b>")
-    for o in sorted(block.orders, key=lambda x: x.seq):
-        lines.append(_format_order_line(o))
     return "\n".join(lines)
 
 
-def _format_order_line(o: Order) -> str:
-    pnl_part = ""
-    if o.pnl is not None:
-        sign = "+" if o.pnl >= 0 else ""
-        pnl_part = f"  pnl {sign}{round(o.pnl, 4)}"
-    fill_part = ""
-    if o.filled_entry_price is not None:
-        fill_part = f"  fill {o.filled_entry_price}"
-    return (
-        f"{_order_state_emoji(o.state)} "
-        f"#{o.seq}  entry <code>{o.entry_price}</code>  "
-        f"TP <code>{o.tp_price}</code>  "
-        f"SL <code>{o.sl_price}</code>  "
-        f"qty <code>{o.qty}</code>  "
-        f"<i>{o.state}</i>"
-        f"{fill_part}{pnl_part}"
-    )
+# =============================================================================
+# Plan / tracker previews
+# =============================================================================
 
 
 def format_plan_preview(payload: dict[str, Any]) -> str:
@@ -100,39 +181,52 @@ def format_plan_preview(payload: dict[str, Any]) -> str:
     cancel_price: float = payload["cancel_price"]
     symbol: str = payload["symbol"]
 
+    side_enum = BlockSide(side) if not isinstance(side, BlockSide) else side
+    block_risk = total_block_risk(
+        side=side_enum,
+        rungs=((e, s, qty) for e, s in zip(entries, sls, strict=True)),
+    )
+
     lines = [
         f"📋 <b>Plan preview</b> — <code>{symbol}</code> <b>{side}</b>",
         f"Cancel price: <code>{cancel_price}</code>",
         f"Quantity per rung: <code>{qty}</code>",
+        f"Block risk (max loss): <code>{block_risk}</code>",
         "",
         "<b>Ladder:</b>",
         "<pre>",
-        f"{'#':>2} {'entry':>10} {'tp':>10} {'sl':>10}",
+        f"{'#':>2} {'entry':>10} {'tp':>10} {'sl':>10} {'risk':>8}",
     ]
     for i, (e, t, s) in enumerate(zip(entries, tps, sls, strict=True), start=1):
-        lines.append(f"{i:>2} {e:>10} {t:>10} {s:>10}")
+        risk = order_risk_amount(side=side_enum, entry_price=e, sl_price=s, qty=qty)
+        lines.append(f"{i:>2} {e:>10} {t:>10} {s:>10} {round(risk, 4):>8}")
     lines.append("</pre>")
     return "\n".join(lines)
 
 
 def format_tracker_preview(symbol: str, side: Any, result: Any) -> str:
-    """Render the proposed ladder discovered from open Binance orders.
-
-    ``side`` is a BlockSide and ``result`` is a tracker.TrackerResult — kept
-    as ``Any`` here to avoid an import cycle (this module is loaded from
-    handlers.py before src.core.tracker would be ready in some setups).
-    """
+    """Render the proposed ladder discovered from open Binance orders."""
     rungs = result.rungs
-    qty = rungs[0].qty if rungs else 0.0
+    side_enum = BlockSide(side) if not isinstance(side, BlockSide) else side
+    block_risk = total_block_risk(
+        side=side_enum,
+        rungs=((r.entry_price, r.sl_price, r.qty) for r in rungs),
+    )
+
     lines = [
         f"🔍 <b>Discovered ladder</b> — <code>{symbol}</code> <b>{side}</b>",
-        f"Rungs: <b>{len(rungs)}</b>   qty per rung: <code>{qty}</code>",
+        f"Rungs: <b>{len(rungs)}</b>",
+        f"Block risk (max loss): <code>{block_risk}</code>",
         "<pre>",
-        f"{'#':>2} {'entry':>10} {'tp':>10} {'sl':>10}",
+        f"{'#':>2} {'entry':>10} {'tp':>10} {'sl':>10} {'qty':>10} {'risk':>8}",
     ]
     for r in rungs:
+        risk = order_risk_amount(
+            side=side_enum, entry_price=r.entry_price, sl_price=r.sl_price, qty=r.qty
+        )
         lines.append(
-            f"{r.seq:>2} {r.entry_price:>10} {r.tp_price:>10} {r.sl_price:>10}"
+            f"{r.seq:>2} {r.entry_price:>10} {r.tp_price:>10} "
+            f"{r.sl_price:>10} {r.qty:>10} {round(risk, 4):>8}"
         )
     lines.append("</pre>")
     if result.warnings:
@@ -142,28 +236,58 @@ def format_tracker_preview(symbol: str, side: Any, result: Any) -> str:
     return "\n".join(lines)
 
 
-# ---------- stats / balance ----------
+# =============================================================================
+# Stats / reports / balance
+# =============================================================================
+
+
+def _stats_window_label(days: int | None) -> str:
+    if days is None:
+        return "All time"
+    if days == 1:
+        return "Today (last 24h)"
+    return f"Last {days} days"
 
 
 def format_stats(stats: dict[str, Any]) -> str:
-    sign = "+" if stats["net_pnl"] >= 0 else ""
+    label = _stats_window_label(stats.get("window_days"))
     return (
-        "📊 <b>Statistics</b>\n"
+        f"📊 <b>Statistics</b> — {label}\n"
         f"Closed blocks: <b>{stats['total_closed']}</b>\n"
         f"🟢 Wins: <b>{stats['wins']}</b> "
         f"({stats['win_rate_pct']}%)\n"
         f"🔴 Losses: <b>{stats['losses']}</b>\n"
-        f"⚠️ Invalid: <b>{stats['invalids']}</b>\n"
+        f"⚫ Invalid: <b>{stats['invalids']}</b>\n"
         f"🚨 Errors: <b>{stats['errors']}</b>\n"
-        f"\nNet P&amp;L: <b>{sign}{stats['net_pnl']}</b> USDT"
+        f"\nNet PnL: <b>{_signed(stats['net_pnl'], 4)}</b> USDT"
     )
+
+
+def format_report(rows: list[dict[str, Any]], *, days: int) -> str:
+    if not rows:
+        return f"📈 <b>Reports</b> — last {days} days\n\nNo closed blocks in this window."
+    lines = [f"📈 <b>Reports</b> — last {days} days", "", "<pre>"]
+    lines.append(f"{'date':<12} {'W':>3} {'L':>3} {'I':>3} {'E':>3} {'net':>10}")
+    for r in rows:
+        lines.append(
+            f"{r['date']:<12} "
+            f"{r['wins']:>3} {r['losses']:>3} "
+            f"{r['invalids']:>3} {r['errors']:>3} "
+            f"{_signed(r['net_pnl'], 4):>10}"
+        )
+    lines.append("</pre>")
+    total_pnl = round(sum(r["net_pnl"] for r in rows), 4)
+    lines.append(f"\nTotal PnL: <b>{_signed(total_pnl, 4)}</b> USDT")
+    return "\n".join(lines)
 
 
 def format_balance(usdt: float) -> str:
     return f"💰 Wallet balance: <b>{usdt:.4f} USDT</b>"
 
 
-# ---------- notifier rendering ----------
+# =============================================================================
+# Notifier rendering (channel + chat)
+# =============================================================================
 
 
 def render_notification(n: Notification) -> str:
@@ -186,21 +310,19 @@ def render_notification(n: Notification) -> str:
         )
     if n.type == NotificationType.SL_HIT:
         pnl = p.get("pnl") or 0.0
-        sign = "+" if pnl >= 0 else ""
         return (
             f"🟥 <b>BLOCK #{n.block_id}</b>\n"
             f"Order <b>#{p.get('seq')}</b> SL hit at "
             f"<code>{p.get('price')}</code> "
-            f"({sign}{round(pnl, 4)})"
+            f"({_signed(pnl, 4)})"
         )
     if n.type == NotificationType.BLOCK_WIN:
         net = p.get("net_pnl") or 0.0
-        sign = "+" if net >= 0 else ""
         return (
             f"🟢 <b>BLOCK #{n.block_id} WIN</b>\n"
             f"Winning rung: <b>#{p.get('win_order_seq')}</b>\n"
             f"TP price: <code>{p.get('tp_price')}</code>\n"
-            f"Net P&amp;L: <b>{sign}{round(net, 4)}</b>\n"
+            f"Net PnL: <b>{_signed(net, 4)}</b>\n"
             f"Pending orders cancelled."
         )
     if n.type == NotificationType.BLOCK_LOSS:
@@ -208,7 +330,7 @@ def render_notification(n: Notification) -> str:
         return (
             f"🔴 <b>BLOCK #{n.block_id} LOSS</b>\n"
             f"All 8 orders stopped out.\n"
-            f"Net P&amp;L: <b>{round(net, 4)}</b>"
+            f"Net PnL: <b>{_signed(net, 4)}</b>"
         )
     if n.type == NotificationType.BLOCK_INVALID:
         cp = p.get("cancel_price")
@@ -217,13 +339,13 @@ def render_notification(n: Notification) -> str:
         if cp is not None and mp is not None:
             extra = f"\nCancel price: <code>{cp}</code>, market: <code>{mp}</code>"
         return (
-            f"⚠️ <b>BLOCK #{n.block_id} INVALID</b>\n"
+            f"⚫ <b>BLOCK #{n.block_id} INVALID</b>\n"
             f"All pending orders cancelled.{extra}"
         )
     if n.type == NotificationType.BLOCK_ERROR:
         return (
             f"🚨 <b>BLOCK #{n.block_id} ERROR</b>\n"
-            f"Reason: {p.get('reason')}\n"
+            f"Reason: {_h(str(p.get('reason')))}\n"
             f"Manual review required."
         )
     if n.type == NotificationType.BLOCK_MANUAL_CLOSE:

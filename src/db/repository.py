@@ -8,7 +8,7 @@ atomic across multiple operations.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import select
@@ -319,13 +319,29 @@ async def add_event(
 # =============================================================================
 
 
-async def aggregate_stats(session: AsyncSession) -> dict[str, Any]:
-    """Compute simple aggregate statistics across all closed blocks."""
+async def aggregate_stats(
+    session: AsyncSession,
+    *,
+    days: int | None = None,
+) -> dict[str, Any]:
+    """Compute aggregate statistics across closed blocks.
+
+    Parameters
+    ----------
+    days:
+        Optional rolling window in days, applied against ``closed_at``.
+        ``None`` means "all time". Pass ``1`` for "today", ``7`` for the
+        last week, etc.
+    """
     stmt = select(Block).where(
         Block.status.in_(
             [BlockStatus.WIN, BlockStatus.LOSS, BlockStatus.INVALID, BlockStatus.ERROR]
         )
     )
+    if days is not None and days > 0:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        stmt = stmt.where(Block.closed_at >= cutoff)
+
     closed_blocks = list((await session.execute(stmt)).scalars().all())
     total = len(closed_blocks)
     wins = sum(1 for b in closed_blocks if b.status == BlockStatus.WIN)
@@ -336,6 +352,7 @@ async def aggregate_stats(session: AsyncSession) -> dict[str, Any]:
 
     win_rate = (wins / total * 100.0) if total else 0.0
     return {
+        "window_days": days,
         "total_closed": total,
         "wins": wins,
         "losses": losses,
@@ -344,3 +361,50 @@ async def aggregate_stats(session: AsyncSession) -> dict[str, Any]:
         "win_rate_pct": round(win_rate, 2),
         "net_pnl": round(net_pnl, 4),
     }
+
+
+async def daily_pnl_breakdown(
+    session: AsyncSession,
+    *,
+    days: int = 7,
+) -> list[dict[str, Any]]:
+    """Per-day breakdown for the ``/reports`` view.
+
+    Returns one entry per day for the last ``days`` days, newest first,
+    with counts of wins/losses/invalids and net PnL summed across blocks
+    closed that calendar day (UTC).
+    """
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+    stmt = (
+        select(Block)
+        .where(Block.status.in_(
+            [BlockStatus.WIN, BlockStatus.LOSS, BlockStatus.INVALID, BlockStatus.ERROR]
+        ))
+        .where(Block.closed_at >= cutoff)
+    )
+    closed = list((await session.execute(stmt)).scalars().all())
+
+    # Bucket by UTC date.
+    by_day: dict[str, dict[str, Any]] = {}
+    for b in closed:
+        if b.closed_at is None:
+            continue
+        day_key = b.closed_at.strftime("%Y-%m-%d")
+        bucket = by_day.setdefault(
+            day_key,
+            {"date": day_key, "wins": 0, "losses": 0, "invalids": 0, "errors": 0, "net_pnl": 0.0},
+        )
+        if b.status == BlockStatus.WIN:
+            bucket["wins"] += 1
+        elif b.status == BlockStatus.LOSS:
+            bucket["losses"] += 1
+        elif b.status == BlockStatus.INVALID:
+            bucket["invalids"] += 1
+        else:
+            bucket["errors"] += 1
+        bucket["net_pnl"] += b.net_pnl or 0.0
+
+    rows = sorted(by_day.values(), key=lambda r: r["date"], reverse=True)
+    for r in rows:
+        r["net_pnl"] = round(r["net_pnl"], 4)
+    return rows

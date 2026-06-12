@@ -21,16 +21,30 @@ from src.bot.formatters import (
     format_block_detail,
     format_block_summary,
     format_plan_preview,
+    format_report,
     format_stats,
     format_tracker_preview,
 )
 from src.bot.keyboards import (
     CB_CANCEL,
     CB_CONFIRM,
+    CB_MENU_BALANCE,
+    CB_MENU_HELP,
+    CB_MENU_LIST,
+    CB_MENU_NEWBLOCK,
+    CB_MENU_REPORTS,
+    CB_MENU_STATS,
+    CB_MENU_TRACK,
     CB_SIDE_BUY,
     CB_SIDE_SELL,
+    CB_STATS_7D,
+    CB_STATS_30D,
+    CB_STATS_ALL,
+    CB_STATS_TODAY,
     confirm_keyboard,
+    main_menu_keyboard,
     side_keyboard,
+    stats_window_keyboard,
 )
 from src.bot.states import NewBlockFSM, TrackBlockFSM
 from src.core.engine import BlockEngine
@@ -85,15 +99,100 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     text = (
         "<b>Commands</b>\n"
+        "/menu — main menu (buttons)\n"
         "/newblock — create a new block (bot places orders)\n"
         "/track — adopt orders you placed manually on Binance/TV\n"
         "/list — show active blocks\n"
-        "/block &lt;id&gt; — block details\n"
+        "/block &lt;id&gt; — block details (with live PnL)\n"
         "/cancel &lt;id&gt; — manually close a block\n"
-        "/stats — aggregate statistics\n"
+        "/stats [days] — aggregate statistics (default: all time)\n"
+        "/reports [days] — daily breakdown (default: 7 days)\n"
         "/balance — wallet balance"
     )
     await _reply_html(message, text)
+
+
+# =============================================================================
+# /menu — top-level inline keyboard
+# =============================================================================
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    await message.answer(
+        "<b>Main menu</b> — pick an action:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == CB_MENU_NEWBLOCK)
+async def menu_newblock(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    if query.message is not None:
+        await cmd_newblock(query.message, state)
+
+
+@router.callback_query(F.data == CB_MENU_TRACK)
+async def menu_track(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    if query.message is not None:
+        await cmd_track(query.message, state)
+
+
+@router.callback_query(F.data == CB_MENU_LIST)
+async def menu_list(query: CallbackQuery) -> None:
+    await query.answer()
+    if query.message is not None:
+        await cmd_list(query.message)
+
+
+@router.callback_query(F.data == CB_MENU_STATS)
+async def menu_stats(query: CallbackQuery) -> None:
+    await query.answer()
+    if query.message is None:
+        return
+    await query.message.answer(
+        "Pick a window:",
+        reply_markup=stats_window_keyboard(),
+    )
+
+
+@router.callback_query(F.data == CB_MENU_REPORTS)
+async def menu_reports(query: CallbackQuery) -> None:
+    await query.answer()
+    if query.message is not None:
+        await _send_reports(query.message, days=7)
+
+
+@router.callback_query(F.data == CB_MENU_BALANCE)
+async def menu_balance(
+    query: CallbackQuery, client: BinanceClient
+) -> None:
+    await query.answer()
+    if query.message is not None:
+        await cmd_balance(query.message, client)
+
+
+@router.callback_query(F.data == CB_MENU_HELP)
+async def menu_help(query: CallbackQuery) -> None:
+    await query.answer()
+    if query.message is not None:
+        await cmd_help(query.message)
+
+
+# Time-window quick picks under /stats menu
+@router.callback_query(
+    F.data.in_({CB_STATS_TODAY, CB_STATS_7D, CB_STATS_30D, CB_STATS_ALL})
+)
+async def stats_window(query: CallbackQuery) -> None:
+    await query.answer()
+    if query.message is None:
+        return
+    days_token = query.data.split(":", 1)[1]
+    days_int = int(days_token)
+    days = days_int if days_int > 0 else None
+    await _send_stats(query.message, days=days)
 
 
 # =============================================================================
@@ -114,7 +213,7 @@ async def cmd_list(message: Message) -> None:
 
 
 @router.message(Command("block"))
-async def cmd_block(message: Message) -> None:
+async def cmd_block(message: Message, engine: BlockEngine) -> None:
     text = (message.text or "").strip()
     parts = text.split()
     if len(parts) < 2:
@@ -130,7 +229,17 @@ async def cmd_block(message: Message) -> None:
     if block is None:
         await message.answer(f"Block #{block_id} not found.")
         return
-    await _reply_html(message, format_block_detail(block))
+
+    # Pull realtime PnL only for non-terminal blocks; terminal blocks
+    # already store final net_pnl, so the formatter just uses that.
+    realtime = None
+    if not block.is_terminal:
+        try:
+            realtime = await engine.compute_block_realtime_pnl(block.id)
+        except Exception:  # noqa: BLE001
+            logger.exception("realtime PnL fetch failed for block={b}", b=block.id)
+
+    await _reply_html(message, format_block_detail(block, realtime_pnl=realtime))
 
 
 @router.message(Command("cancel"))
@@ -151,9 +260,54 @@ async def cmd_cancel(message: Message, engine: BlockEngine) -> None:
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
+    text = (message.text or "").strip()
+    parts = text.split()
+    days: int | None = None
+    if len(parts) >= 2:
+        token = parts[1].lower().rstrip("d")
+        if token == "today":
+            days = 1
+        elif token == "all":
+            days = None
+        else:
+            try:
+                parsed = int(token)
+            except ValueError:
+                await _reply_plain(
+                    message,
+                    "Usage: /stats [today | 7 | 30 | all]"
+                )
+                return
+            days = parsed if parsed > 0 else None
+    await _send_stats(message, days=days)
+
+
+@router.message(Command("reports"))
+async def cmd_reports(message: Message) -> None:
+    text = (message.text or "").strip()
+    parts = text.split()
+    days = 7
+    if len(parts) >= 2:
+        try:
+            parsed = int(parts[1])
+            if 1 <= parsed <= 90:
+                days = parsed
+        except ValueError:
+            await _reply_plain(message, "Usage: /reports [days 1..90]")
+            return
+    await _send_reports(message, days=days)
+
+
+async def _send_stats(message: Message, *, days: int | None) -> None:
     async with session_scope() as session:
-        stats = await repository.aggregate_stats(session)
+        stats = await repository.aggregate_stats(session, days=days)
     await _reply_html(message, format_stats(stats))
+
+
+async def _send_reports(message: Message, *, days: int) -> None:
+    async with session_scope() as session:
+        rows = await repository.daily_pnl_breakdown(session, days=days)
+    await _reply_html(message, format_report(list(rows), days=days))
 
 
 @router.message(Command("balance"))

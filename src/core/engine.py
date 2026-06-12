@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import Settings
 from src.core.notifications import Notification, NotificationHandler, NotificationType
 from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan
+from src.core.risk import order_risk_amount, total_block_risk
 from src.db import (
     Block,
     BlockSide,
@@ -127,6 +128,79 @@ class BlockEngine:
             )
 
     # ----- Public API -----
+
+    async def compute_block_realtime_pnl(self, block_id: int) -> dict | None:
+        """Return realised + unrealised PnL for an active block.
+
+        For closed orders we sum :attr:`Order.pnl`, which the engine
+        populates from Binance's ``realizedPnl`` (already net of fees).
+        For still-open positions (``TRIGGERED`` state) we estimate
+        unrealised PnL from the current mark price, the order's filled
+        entry price, and its quantity.
+
+        Returns ``None`` if the block doesn't exist. The output dict has
+        the shape ``{realised, unrealised, total, mark_price, open_count}``.
+        Mark price is fetched only once per call regardless of how many
+        rungs are open.
+        """
+        async with session_scope() as session:
+            block = await repository.get_block(session, block_id)
+            if block is None:
+                return None
+            symbol = block.symbol
+            side = block.side
+            orders_snapshot = [
+                {
+                    "state": o.state,
+                    "qty": o.qty,
+                    "filled_entry": o.filled_entry_price,
+                    "pnl": o.pnl,
+                }
+                for o in block.orders
+            ]
+
+        realised = round(sum((o["pnl"] or 0.0) for o in orders_snapshot), 6)
+        open_orders = [
+            o for o in orders_snapshot
+            if o["state"] == OrderState.TRIGGERED and o["filled_entry"] is not None
+        ]
+
+        if not open_orders:
+            return {
+                "realised": realised,
+                "unrealised": 0.0,
+                "total": realised,
+                "mark_price": None,
+                "open_count": 0,
+            }
+
+        try:
+            mark_price = await self._client.get_mark_price(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mark price fetch failed for block={b}: {err}", b=block_id, err=exc
+            )
+            return {
+                "realised": realised,
+                "unrealised": None,  # signal "unknown" rather than fake-zero
+                "total": realised,
+                "mark_price": None,
+                "open_count": len(open_orders),
+            }
+
+        direction = 1.0 if side == BlockSide.BUY else -1.0
+        unrealised = sum(
+            direction * (mark_price - o["filled_entry"]) * o["qty"]
+            for o in open_orders
+        )
+
+        return {
+            "realised": realised,
+            "unrealised": round(unrealised, 6),
+            "total": round(realised + unrealised, 6),
+            "mark_price": mark_price,
+            "open_count": len(open_orders),
+        }
 
     async def discover_tracked_orders(
         self, *, symbol: str, side: BlockSide
