@@ -14,6 +14,13 @@ The grouping strategy is deliberately conservative:
 * If pairing is ambiguous (two TPs match the same entry) we pick the
   one closest to the entry — that maps to the user's own order book
   visualisation more naturally.
+
+Binance's "TP/SL" UI checkbox (and TradingView's bracket-order panel)
+generates exit orders flagged ``closePosition: true``. Those carry no
+quantity of their own — at trigger time the exchange closes whatever
+of the position is still open. We treat them as **wildcards**: they
+slot into any rung's qty bucket that lacks an exact-qty pair, sorted
+by trigger price the same way regular reduce-only orders are.
 """
 
 from __future__ import annotations
@@ -104,10 +111,16 @@ def discover_block(
     exit_side = "SELL" if side == BlockSide.BUY else "BUY"
     position_side = "LONG" if side == BlockSide.BUY else "SHORT"
 
-    # 2. Bucket the candidates.
+    # 2. Classify candidates. closePosition orders share the same pool
+    #    as regular reduce-only TP/SL — they have origQty=0 and only
+    #    fire if any of the position is open at trigger time, so they
+    #    can stand in for any rung. We track that any closePosition
+    #    order was used so the user gets a warning at confirmation
+    #    time about the slightly different gap-scenario behaviour.
     entries: list[dict[str, Any]] = []
     tps: list[dict[str, Any]] = []
     sls: list[dict[str, Any]] = []
+    close_position_seen = False
 
     for o in candidates:
         if not _matches_position(o, position_side):
@@ -117,8 +130,12 @@ def discover_block(
             entries.append(o)
         elif kind == "tp":
             tps.append(o)
+            if _is_close_position(o):
+                close_position_seen = True
         elif kind == "sl":
             sls.append(o)
+            if _is_close_position(o):
+                close_position_seen = True
 
     # 3. Validate counts.
     if len(entries) != expected_rungs:
@@ -131,142 +148,110 @@ def discover_block(
                 "the extras) and try again."
             ),
         )
-
-    # 4. Group entries / TPs / SLs by quantity. The user is allowed to
-    #    pick a different size per rung (different risk per order) so
-    #    we cannot assume one global qty. Within each qty bucket we
-    #    sort by price and pair index-wise — this keeps ladder offsets
-    #    intact while supporting the simple all-same-qty case as a
-    #    degenerate one-bucket scenario.
-    descending = side == BlockSide.BUY
-
-    qty_buckets: dict[float, dict[str, list[dict[str, Any]]]] = {}
-
-    def _bucket(qty_key: float) -> dict[str, list[dict[str, Any]]]:
-        return qty_buckets.setdefault(qty_key, {"entries": [], "tps": [], "sls": []})
-
-    for e in entries:
-        _bucket(_qty_key(e.get("origQty", 0)))["entries"].append(e)
-    for t in tps:
-        _bucket(_qty_key(t.get("origQty", 0)))["tps"].append(t)
-    for s in sls:
-        _bucket(_qty_key(s.get("origQty", 0)))["sls"].append(s)
-
-    rungs: list[TrackedRung] = []
-
-    # Process buckets in a deterministic order (largest qty first feels
-    # natural but is purely cosmetic; final rungs are re-sorted below).
-    for qty_key in sorted(qty_buckets.keys(), reverse=True):
-        bucket = qty_buckets[qty_key]
-        bucket_entries = bucket["entries"]
-        if not bucket_entries:
-            continue  # qty appears only on a TP/SL — irrelevant by itself.
-
-        sorted_entries = sorted(
-            bucket_entries, key=lambda o: float(o["price"]), reverse=descending
-        )
-        bucket_tps = sorted(bucket["tps"], key=_tp_price_of, reverse=descending)
-        bucket_sls = sorted(bucket["sls"], key=_sl_price_of, reverse=descending)
-
-        if len(bucket_tps) < len(sorted_entries):
-            return TrackerResult(
-                rungs=[], warnings=[],
-                error=(
-                    f"Quantity bucket {qty_key}: need {len(sorted_entries)} "
-                    f"TP order(s) at this size, found {len(bucket_tps)}."
-                ),
-            )
-        if len(bucket_sls) < len(sorted_entries):
-            return TrackerResult(
-                rungs=[], warnings=[],
-                error=(
-                    f"Quantity bucket {qty_key}: need {len(sorted_entries)} "
-                    f"SL order(s) at this size, found {len(bucket_sls)}."
-                ),
-            )
-
-        # Pair index-wise; extras at this qty go back to the pool but
-        # since we partition by qty there is no other consumer here.
-        for entry, tp, sl in zip(
-            sorted_entries,
-            bucket_tps[: len(sorted_entries)],
-            bucket_sls[: len(sorted_entries)],
-            strict=True,
-        ):
-            entry_price = float(entry["price"])
-            tp_price = _tp_price_of(tp)
-            sl_price = _sl_price_of(sl)
-
-            if side == BlockSide.BUY:
-                if tp_price <= entry_price:
-                    return TrackerResult(
-                        rungs=[], warnings=[],
-                        error=(
-                            f"BUY rung at {entry_price}: TP {tp_price} must "
-                            "be above entry."
-                        ),
-                    )
-                if sl_price >= entry_price:
-                    return TrackerResult(
-                        rungs=[], warnings=[],
-                        error=(
-                            f"BUY rung at {entry_price}: SL {sl_price} must "
-                            "be below entry."
-                        ),
-                    )
-            else:
-                if tp_price >= entry_price:
-                    return TrackerResult(
-                        rungs=[], warnings=[],
-                        error=(
-                            f"SELL rung at {entry_price}: TP {tp_price} must "
-                            "be below entry."
-                        ),
-                    )
-                if sl_price <= entry_price:
-                    return TrackerResult(
-                        rungs=[], warnings=[],
-                        error=(
-                            f"SELL rung at {entry_price}: SL {sl_price} must "
-                            "be above entry."
-                        ),
-                    )
-
-            rungs.append(
-                TrackedRung(
-                    seq=0,  # renumbered below after we sort by price
-                    entry_price=entry_price,
-                    tp_price=tp_price,
-                    sl_price=sl_price,
-                    qty=float(entry["origQty"]),
-                    entry_order_id=str(entry["orderId"]),
-                    tp_order_id=str(tp["orderId"]),
-                    sl_order_id=str(sl["orderId"]),
-                )
-            )
-
-    if len(rungs) != expected_rungs:
+    if len(tps) < expected_rungs:
         return TrackerResult(
             rungs=[], warnings=[],
             error=(
-                f"Could only pair {len(rungs)} rung(s); expected "
-                f"{expected_rungs}. Make sure every entry has a matching "
-                "TP and SL with the same quantity."
+                f"Need {expected_rungs} TP order(s) on the exit side; "
+                f"found {len(tps)}. Each entry needs its own TP — either "
+                "as a reduce-only LIMIT/TAKE_PROFIT_MARKET with the entry's "
+                "quantity, or with the \"close position\" flag set."
+            ),
+        )
+    if len(sls) < expected_rungs:
+        return TrackerResult(
+            rungs=[], warnings=[],
+            error=(
+                f"Need {expected_rungs} SL order(s) on the exit side; "
+                f"found {len(sls)}. Each entry needs its own STOP_MARKET — "
+                "either reduce-only with matching quantity, or with the "
+                "\"close position\" flag set."
             ),
         )
 
-    # 5. Sort the final ladder by entry price (descending for BUY,
-    #    ascending for SELL) and assign seq numbers 1..N.
-    rungs.sort(key=lambda r: r.entry_price, reverse=descending)
-    for i, rung in enumerate(rungs, start=1):
-        rung.seq = i
+    # 4. Sort everything in ladder order — for BUY the highest-priced
+    #    entry pairs with the highest TP and SL, and so on. With
+    #    consistent ladder layouts this works whether the trader chose
+    #    exact-qty reduce-only orders, "close position" orders, or
+    #    mixed both. Per-rung qty math always uses the *entry's* qty,
+    #    so wildcard TP/SL orders with origQty=0 don't break risk
+    #    accounting.
+    descending = side == BlockSide.BUY
+    entries.sort(key=lambda o: float(o["price"]), reverse=descending)
+    tps.sort(key=_tp_price_of, reverse=descending)
+    sls.sort(key=_sl_price_of, reverse=descending)
 
-    # 6. Surface warnings about leftover unmatched TP/SL orders.
-    used_tp_ids = {r.tp_order_id for r in rungs}
-    used_sl_ids = {r.sl_order_id for r in rungs}
-    leftover_tp = sum(1 for t in tps if str(t["orderId"]) not in used_tp_ids)
-    leftover_sl = sum(1 for s in sls if str(s["orderId"]) not in used_sl_ids)
+    used_tps = tps[:expected_rungs]
+    used_sls = sls[:expected_rungs]
+
+    rungs: list[TrackedRung] = []
+    for seq, (entry, tp, sl) in enumerate(
+        zip(entries, used_tps, used_sls, strict=True), start=1
+    ):
+        entry_price = float(entry["price"])
+        tp_price = _tp_price_of(tp)
+        sl_price = _sl_price_of(sl)
+
+        if side == BlockSide.BUY:
+            if tp_price <= entry_price:
+                return TrackerResult(
+                    rungs=[], warnings=[],
+                    error=(
+                        f"BUY rung {seq} (entry {entry_price}): TP "
+                        f"{tp_price} must be above entry."
+                    ),
+                )
+            if sl_price >= entry_price:
+                return TrackerResult(
+                    rungs=[], warnings=[],
+                    error=(
+                        f"BUY rung {seq} (entry {entry_price}): SL "
+                        f"{sl_price} must be below entry."
+                    ),
+                )
+        else:
+            if tp_price >= entry_price:
+                return TrackerResult(
+                    rungs=[], warnings=[],
+                    error=(
+                        f"SELL rung {seq} (entry {entry_price}): TP "
+                        f"{tp_price} must be below entry."
+                    ),
+                )
+            if sl_price <= entry_price:
+                return TrackerResult(
+                    rungs=[], warnings=[],
+                    error=(
+                        f"SELL rung {seq} (entry {entry_price}): SL "
+                        f"{sl_price} must be above entry."
+                    ),
+                )
+
+        rungs.append(
+            TrackedRung(
+                seq=seq,
+                entry_price=entry_price,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                qty=float(entry["origQty"]),  # always the entry's qty
+                entry_order_id=str(entry["orderId"]),
+                tp_order_id=str(tp["orderId"]),
+                sl_order_id=str(sl["orderId"]),
+            )
+        )
+
+    # 5. Warnings — closePosition behaviour, plus any leftover orders
+    #    we ignored.
     warnings: list[str] = []
+    if close_position_seen:
+        warnings.append(
+            "Some TP/SL orders use \"close position\" mode — at trigger "
+            "time they close the whole open position on this side, not "
+            "just one rung's quantity. With chain mode (only one rung "
+            "open at a time) the effect is identical."
+        )
+    leftover_tp = len(tps) - expected_rungs
+    leftover_sl = len(sls) - expected_rungs
     if leftover_tp:
         warnings.append(f"{leftover_tp} extra TP order(s) ignored.")
     if leftover_sl:
@@ -287,6 +272,20 @@ def _matches_position(order: dict[str, Any], position_side: str) -> bool:
 def _is_reduce_only(order: dict[str, Any]) -> bool:
     """Binance returns either bool or string; normalise."""
     raw = order.get("reduceOnly")
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).lower() == "true"
+
+
+def _is_close_position(order: dict[str, Any]) -> bool:
+    """Binance's ``closePosition`` flag, normalised across bool / string.
+
+    Set by the UI's "TP/SL" checkbox and by TradingView bracket orders.
+    The exchange treats these as "close whatever of the position is
+    open at trigger time", which is why we route them through a
+    qty-agnostic wildcard pool in :func:`discover_block`.
+    """
+    raw = order.get("closePosition")
     if isinstance(raw, bool):
         return raw
     return str(raw).lower() == "true"
