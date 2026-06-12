@@ -107,7 +107,8 @@ async def cmd_help(message: Message) -> None:
         "/cancel &lt;id&gt; — manually close a block\n"
         "/stats [days] — aggregate statistics (default: all time)\n"
         "/reports [days] — daily breakdown (default: 7 days)\n"
-        "/balance — wallet balance"
+        "/balance — wallet balance\n"
+        "/raw &lt;symbol&gt; — diagnostic: dump open orders on a symbol"
     )
     await _reply_html(message, text)
 
@@ -319,6 +320,50 @@ async def cmd_balance(message: Message, client: BinanceClient) -> None:
         await _reply_plain(message, f"Failed to fetch balance: {exc}")
         return
     await _reply_html(message, format_balance(usdt))
+
+
+@router.message(Command("raw"))
+async def cmd_raw(message: Message, client: BinanceClient) -> None:
+    """Diagnostic: dump every open order on a symbol as compact JSON.
+
+    Lets the trader (or me) see exactly how Binance reports their
+    manually-placed orders when /track refuses to pair them. Output
+    is plain text so Telegram never tries to parse exchange payloads
+    as HTML.
+    """
+    text = (message.text or "").strip()
+    parts = text.split()
+    if len(parts) < 2:
+        await _reply_plain(message, "Usage: /raw <symbol>  (e.g. /raw BTCUSDT)")
+        return
+    symbol = parts[1].upper()
+    try:
+        orders = await client.list_open_orders(symbol)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("list_open_orders failed")
+        await _reply_plain(message, f"Failed to fetch orders for {symbol}: {exc}")
+        return
+
+    if not orders:
+        await _reply_plain(message, f"{symbol}: 0 open orders.")
+        return
+
+    # Trim to the fields the tracker actually inspects so the message
+    # stays under Telegram's 4 KB ceiling even with dozens of orders.
+    lines: list[str] = [f"{symbol}: {len(orders)} open order(s)"]
+    for o in orders:
+        lines.append(
+            f"  id={o.get('orderId')} type={o.get('type')} side={o.get('side')} "
+            f"posSide={o.get('positionSide','BOTH')} "
+            f"reduceOnly={o.get('reduceOnly')} closePos={o.get('closePosition')} "
+            f"price={o.get('price')} stopPrice={o.get('stopPrice')} "
+            f"qty={o.get('origQty')}"
+        )
+    body = "\n".join(lines)
+    # Telegram caps at ~4096 chars per message; chunk if necessary.
+    while body:
+        await _reply_plain(message, body[:3500])
+        body = body[3500:]
 
 
 # =============================================================================

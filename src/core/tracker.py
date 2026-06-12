@@ -121,8 +121,20 @@ def discover_block(
     tps: list[dict[str, Any]] = []
     sls: list[dict[str, Any]] = []
     close_position_seen = False
+    # Diagnostics — every candidate gets a short label so error messages
+    # can tell the trader what the bot actually saw on Binance.
+    classification_counts: dict[str, int] = {}
 
     for o in candidates:
+        type_label = (
+            f"{str(o.get('type','?'))}/"
+            f"{str(o.get('side','?'))}/"
+            f"ps={str(o.get('positionSide','?'))}/"
+            f"reduceOnly={_is_reduce_only(o)}/"
+            f"closePos={_is_close_position(o)}"
+        )
+        classification_counts[type_label] = classification_counts.get(type_label, 0) + 1
+
         if not _matches_position(o, position_side):
             continue
         kind = _classify(o, entry_side=entry_side, exit_side=exit_side)
@@ -137,6 +149,13 @@ def discover_block(
             if _is_close_position(o):
                 close_position_seen = True
 
+    def _diag_breakdown() -> str:
+        """Compact one-line snapshot of what we actually saw on Binance."""
+        if not classification_counts:
+            return "no orders on this symbol"
+        rows = sorted(classification_counts.items(), key=lambda kv: -kv[1])
+        return "; ".join(f"{n}x {label}" for label, n in rows)
+
     # 3. Validate counts.
     if len(entries) != expected_rungs:
         return TrackerResult(
@@ -144,8 +163,8 @@ def discover_block(
             warnings=[],
             error=(
                 f"Need exactly {expected_rungs} unassigned entry orders for "
-                f"{side}, found {len(entries)}. Place 8 entries (or cancel "
-                "the extras) and try again."
+                f"{side}, found {len(entries)}.\n\n"
+                f"What the bot saw: {_diag_breakdown()}"
             ),
         )
     if len(tps) < expected_rungs:
@@ -155,7 +174,8 @@ def discover_block(
                 f"Need {expected_rungs} TP order(s) on the exit side; "
                 f"found {len(tps)}. Each entry needs its own TP — either "
                 "as a reduce-only LIMIT/TAKE_PROFIT_MARKET with the entry's "
-                "quantity, or with the \"close position\" flag set."
+                "quantity, or with the \"close position\" flag set.\n\n"
+                f"What the bot saw: {_diag_breakdown()}"
             ),
         )
     if len(sls) < expected_rungs:
@@ -165,7 +185,8 @@ def discover_block(
                 f"Need {expected_rungs} SL order(s) on the exit side; "
                 f"found {len(sls)}. Each entry needs its own STOP_MARKET — "
                 "either reduce-only with matching quantity, or with the "
-                "\"close position\" flag set."
+                "\"close position\" flag set.\n\n"
+                f"What the bot saw: {_diag_breakdown()}"
             ),
         )
 
