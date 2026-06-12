@@ -686,21 +686,49 @@ async def cmd_track(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(TrackBlockFSM.SYMBOL)
     await message.answer(
-        "Step 1/3 — send the symbol whose open orders you want to adopt "
-        "(e.g. <code>BTCUSDT</code>).",
+        "Step 1/2 — send the symbol whose open orders you want to adopt "
+        "(e.g. <code>BTCUSDT</code>). The bot will auto-detect the side "
+        "from your orders.",
         parse_mode=ParseMode.HTML,
     )
 
 
 @router.message(TrackBlockFSM.SYMBOL, F.text)
-async def track_symbol(message: Message, state: FSMContext) -> None:
+async def track_symbol(
+    message: Message,
+    state: FSMContext,
+    engine: BlockEngine,
+) -> None:
     symbol = (message.text or "").strip().upper()
     if not symbol.isalnum() or len(symbol) < 4:
         await message.answer("Invalid symbol. Try again.")
         return
     await state.update_data(symbol=symbol)
+
+    # Try to auto-detect the side. If unambiguous, skip the manual
+    # BUY/SELL prompt entirely.
+    try:
+        side, detect_err = await engine.auto_detect_track_side(symbol)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("auto_detect_track_side failed")
+        await _reply_plain(message, f"❌ Could not read orders: {exc}")
+        await state.clear()
+        return
+
+    if side is not None:
+        await message.answer(
+            f"Auto-detected side: <b>{side}</b> from your open orders.",
+            parse_mode=ParseMode.HTML,
+        )
+        await _run_track_discovery(message, state, engine, symbol=symbol, side=side)
+        return
+
+    # Ambiguous — fall back to manual side selection.
+    await message.answer(
+        f"Couldn't auto-detect side: {detect_err}\n\nPick manually:",
+        reply_markup=side_keyboard(),
+    )
     await state.set_state(TrackBlockFSM.SIDE)
-    await message.answer("Step 2/3 — choose side:", reply_markup=side_keyboard())
 
 
 @router.callback_query(TrackBlockFSM.SIDE, F.data.in_({CB_SIDE_BUY, CB_SIDE_SELL}))
@@ -711,23 +739,35 @@ async def track_side(
     data = await state.get_data()
     symbol: str = data["symbol"]
     await query.answer()
-    await query.message.answer("🔍 Reading your open orders from Binance…")
+    if query.message is None:
+        return
+    await _run_track_discovery(query.message, state, engine, symbol=symbol, side=side)
+
+
+async def _run_track_discovery(
+    message: Message,
+    state: FSMContext,
+    engine: BlockEngine,
+    *,
+    symbol: str,
+    side: BlockSide,
+) -> None:
+    """Shared discovery + preview logic used by both auto and manual paths."""
+    await message.answer("🔍 Reading your open orders from Binance…")
 
     try:
         result = await engine.discover_tracked_orders(symbol=symbol, side=side)
     except Exception as exc:  # noqa: BLE001
         logger.exception("discover_tracked_orders failed")
-        await _reply_plain(query.message, f"❌ Could not read orders: {exc}")
+        await _reply_plain(message, f"❌ Could not read orders: {exc}")
         await state.clear()
         return
 
     if result.error:
-        await _reply_plain(query.message, f"❌ {result.error}")
+        await _reply_plain(message, f"❌ {result.error}")
         await state.clear()
         return
 
-    # Stash the result so the confirm step can persist it without
-    # re-fetching from Binance (which could race with new fills).
     await state.update_data(
         side=str(side),
         rungs=[
@@ -746,12 +786,12 @@ async def track_side(
         warnings=result.warnings,
     )
 
-    await query.message.answer(
+    await message.answer(
         format_tracker_preview(symbol, side, result),
         parse_mode=ParseMode.HTML,
     )
     await state.set_state(TrackBlockFSM.CANCEL_PRICE)
-    await query.message.answer("Step 3/3 — cancel price?")
+    await message.answer("Step 2/2 — cancel price?")
 
 
 @router.message(TrackBlockFSM.CANCEL_PRICE, F.text)

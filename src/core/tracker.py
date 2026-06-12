@@ -21,6 +21,11 @@ quantity of their own — at trigger time the exchange closes whatever
 of the position is still open. We treat them as **wildcards**: they
 slot into any rung's qty bucket that lacks an exact-qty pair, sorted
 by trigger price the same way regular reduce-only orders are.
+
+In addition to ``discover_block`` (caller specifies the side),
+``auto_detect_side`` lets the bot infer the side from the
+unassigned LIMIT entries on a symbol so the ``/track`` flow can skip
+the manual BUY/SELL question whenever the answer is unambiguous.
 """
 
 from __future__ import annotations
@@ -77,6 +82,65 @@ class TrackerResult:
 
 
 # ---------- public API ----------
+
+
+def auto_detect_side(
+    open_orders: list[dict[str, Any]],
+    *,
+    assigned_order_ids: set[str],
+    expected_rungs: int = EXPECTED_ORDERS_PER_BLOCK,
+) -> tuple[BlockSide | None, str | None]:
+    """Infer the block's side from unassigned LIMIT entries on the symbol.
+
+    Returns ``(side, error)``:
+
+    * ``(BlockSide.BUY, None)`` — exactly ``expected_rungs`` BUY entries
+      and zero SELL entries are unassigned.
+    * ``(BlockSide.SELL, None)`` — symmetrical case.
+    * ``(None, error)`` — couldn't decide; the message explains why so
+      the Telegram flow can fall back to asking the trader manually.
+
+    Only LIMIT orders are considered (TP/SL exit orders are skipped),
+    so the rule is simple: "the side matches the side of the entries
+    you placed". Reduce-only and closePosition flags exclude exit
+    orders even when they happen to be LIMIT type.
+    """
+    candidates = [
+        o for o in open_orders if str(o.get("orderId", "")) not in assigned_order_ids
+    ]
+
+    n_buy = 0
+    n_sell = 0
+    for o in candidates:
+        otype = str(o.get("type", "")).upper()
+        if otype != "LIMIT":
+            continue
+        if _is_reduce_only(o) or _is_close_position(o):
+            continue
+        side = str(o.get("side", "")).upper()
+        if side == "BUY":
+            n_buy += 1
+        elif side == "SELL":
+            n_sell += 1
+
+    if n_buy == expected_rungs and n_sell == 0:
+        return BlockSide.BUY, None
+    if n_sell == expected_rungs and n_buy == 0:
+        return BlockSide.SELL, None
+    if n_buy == 0 and n_sell == 0:
+        return None, (
+            "No unassigned LIMIT entry orders found on this symbol. "
+            "Place 8 entries on the chart first, then run /track."
+        )
+    if n_buy >= expected_rungs and n_sell >= expected_rungs:
+        return None, (
+            f"Found {n_buy} BUY and {n_sell} SELL entries on this symbol — "
+            "please pick a side manually."
+        )
+    return None, (
+        f"Found {n_buy} BUY entry order(s) and {n_sell} SELL entry order(s); "
+        f"need exactly {expected_rungs} on one side."
+    )
 
 
 def discover_block(

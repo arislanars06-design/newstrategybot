@@ -129,6 +129,23 @@ class BlockEngine:
 
     # ----- Public API -----
 
+    async def auto_detect_track_side(self, symbol: str):
+        """Try to infer the block's side from unassigned entries.
+
+        Returns ``(side, error)`` — exactly the contract of
+        :func:`tracker.auto_detect_side`. Lets the Telegram flow skip
+        the BUY/SELL question whenever the symbol unambiguously has
+        eight entries on a single side.
+        """
+        from src.core.tracker import auto_detect_side as _auto
+
+        open_orders = await self._client.list_open_orders(symbol)
+        async with session_scope() as session:
+            assigned = await repository.get_assigned_exchange_order_ids(
+                session, symbol=symbol
+            )
+        return _auto(open_orders, assigned_order_ids=assigned)
+
     async def compute_block_realtime_pnl(self, block_id: int) -> dict | None:
         """Return realised + unrealised PnL for an active block.
 
