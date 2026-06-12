@@ -92,31 +92,27 @@ async def _reply_plain(message: Message, text: str) -> None:
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
-    await _reply_html(
-        message,
-        "👋 <b>newstrategybot</b>\n\n"
-        "Trade blocks of 8 chained limit orders on Binance Futures.\n\n"
-        "Type /help to see all commands.",
+    """Open the main menu directly — no welcome wall, no command list.
+
+    The trader explicitly asked for /start to drop them straight into
+    the menu so they never have to memorise commands. Power-user
+    commands (/track, /list, /block, /modify, ...) still work but
+    aren't advertised here.
+    """
+    await message.answer(
+        "📦 <b>newstrategybot</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
     )
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    text = (
-        "<b>Commands</b>\n"
-        "/menu — main menu (buttons)\n"
-        "/newblock — create a new block (bot places orders)\n"
-        "/track — adopt orders you placed manually on Binance/TV\n"
-        "/list — show active blocks\n"
-        "/block &lt;id&gt; — block details (with live PnL)\n"
-        "/cancel &lt;id&gt; — manually close a block\n"
-        "/modify &lt;id&gt; &lt;new_cancel_price&gt; — change cancel price of an active block\n"
-        "/stats [days|today|all] — aggregate statistics (default: all time)\n"
-        "/reports [days] — daily breakdown (default: 7 days)\n"
-        "/balance — wallet balance\n"
-        "/raw &lt;symbol&gt; — diagnostic: dump open orders on a symbol"
+    """Minimal help — points at /menu and stays out of the way."""
+    await message.answer(
+        "Open the main menu with /menu.",
+        reply_markup=main_menu_keyboard(),
     )
-    await _reply_html(message, text)
 
 
 # =============================================================================

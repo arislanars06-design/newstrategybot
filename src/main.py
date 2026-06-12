@@ -17,7 +17,7 @@ import sys
 from loguru import logger
 
 from src.bot.notifier import TelegramNotifier
-from src.bot.setup import build_bot, build_dispatcher
+from src.bot.setup import build_bot, build_dispatcher, install_bot_commands
 from src.config import get_settings
 from src.core.engine import BlockEngine
 from src.db import close_db, init_db
@@ -61,6 +61,7 @@ async def _amain() -> int:
             "Channel mirroring enabled for block events (channel_id={cid})",
             cid=settings.telegram_notify_channel_id,
         )
+    await install_bot_commands(bot)
     engine = BlockEngine(
         settings=settings,
         client=client,
