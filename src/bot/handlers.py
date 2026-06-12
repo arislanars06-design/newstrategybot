@@ -26,21 +26,26 @@ from src.bot.formatters import (
     format_tracker_preview,
 )
 from src.bot.keyboards import (
+    CB_BLOCK_CANCEL,
+    CB_BLOCK_CREATE,
+    CB_BLOCK_LIST,
+    CB_BLOCK_MODIFY,
     CB_CANCEL,
     CB_CONFIRM,
+    CB_MENU_BACK,
     CB_MENU_BALANCE,
-    CB_MENU_HELP,
-    CB_MENU_LIST,
-    CB_MENU_NEWBLOCK,
-    CB_MENU_REPORTS,
+    CB_MENU_BLOCK,
     CB_MENU_STATS,
-    CB_MENU_TRACK,
     CB_SIDE_BUY,
     CB_SIDE_SELL,
+    CB_STATS_1Y,
+    CB_STATS_3MO,
+    CB_STATS_6MO,
     CB_STATS_7D,
     CB_STATS_30D,
     CB_STATS_ALL,
     CB_STATS_TODAY,
+    block_submenu_keyboard,
     confirm_keyboard,
     main_menu_keyboard,
     side_keyboard,
@@ -105,7 +110,8 @@ async def cmd_help(message: Message) -> None:
         "/list — show active blocks\n"
         "/block &lt;id&gt; — block details (with live PnL)\n"
         "/cancel &lt;id&gt; — manually close a block\n"
-        "/stats [days] — aggregate statistics (default: all time)\n"
+        "/modify &lt;id&gt; &lt;new_cancel_price&gt; — change cancel price of an active block\n"
+        "/stats [days|today|all] — aggregate statistics (default: all time)\n"
         "/reports [days] — daily breakdown (default: 7 days)\n"
         "/balance — wallet balance\n"
         "/raw &lt;symbol&gt; — diagnostic: dump open orders on a symbol"
@@ -114,7 +120,7 @@ async def cmd_help(message: Message) -> None:
 
 
 # =============================================================================
-# /menu — top-level inline keyboard
+# /menu — top-level inline keyboard with nested submenus
 # =============================================================================
 
 
@@ -127,25 +133,99 @@ async def cmd_menu(message: Message) -> None:
     )
 
 
-@router.callback_query(F.data == CB_MENU_NEWBLOCK)
-async def menu_newblock(query: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == CB_MENU_BACK)
+async def menu_back(query: CallbackQuery) -> None:
     await query.answer()
     if query.message is not None:
-        await cmd_newblock(query.message, state)
+        await query.message.answer(
+            "<b>Main menu</b>:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard(),
+        )
 
 
-@router.callback_query(F.data == CB_MENU_TRACK)
-async def menu_track(query: CallbackQuery, state: FSMContext) -> None:
+# ----- Block submenu --------------------------------------------------------
+
+
+@router.callback_query(F.data == CB_MENU_BLOCK)
+async def menu_block(query: CallbackQuery) -> None:
     await query.answer()
     if query.message is not None:
+        await query.message.answer(
+            "<b>Block</b> — pick an action:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=block_submenu_keyboard(),
+        )
+
+
+@router.callback_query(F.data == CB_BLOCK_CREATE)
+async def block_create(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    if query.message is not None:
+        # Yaratish = adopt user-placed orders via /track. /newblock is
+        # still available as a command for traders who want the bot to
+        # place the orders for them, but the trader's spec uses
+        # manual placement + bot tracking, so the menu surfaces /track.
         await cmd_track(query.message, state)
 
 
-@router.callback_query(F.data == CB_MENU_LIST)
-async def menu_list(query: CallbackQuery) -> None:
+@router.callback_query(F.data == CB_BLOCK_LIST)
+async def block_list_cb(query: CallbackQuery) -> None:
     await query.answer()
     if query.message is not None:
         await cmd_list(query.message)
+
+
+@router.callback_query(F.data == CB_BLOCK_CANCEL)
+async def block_cancel_cb(query: CallbackQuery) -> None:
+    await query.answer()
+    if query.message is None:
+        return
+    async with session_scope() as session:
+        active = await repository.list_active_blocks(session)
+    if not active:
+        await query.message.answer("No active blocks to cancel.")
+        return
+    lines = ["✋ <b>Cancel a block</b>", "", "Pick one and run:"]
+    lines.append("<pre>")
+    for b in active:
+        lines.append(f"/cancel {b.id}    {b.symbol} {b.side} (status {b.status})")
+    lines.append("</pre>")
+    await query.message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == CB_BLOCK_MODIFY)
+async def block_modify_cb(query: CallbackQuery) -> None:
+    await query.answer()
+    if query.message is None:
+        return
+    async with session_scope() as session:
+        active = await repository.list_active_blocks(session)
+    eligible = [
+        b for b in active if b.cancel_price_active and not b.is_terminal
+    ]
+    if not eligible:
+        await query.message.answer(
+            "No blocks with an active cancel price (modifying is only "
+            "allowed before any order has triggered)."
+        )
+        return
+    lines = [
+        "✏️ <b>Modify cancel price</b>",
+        "",
+        "Pick one and run:",
+        "<pre>",
+    ]
+    for b in eligible:
+        lines.append(
+            f"/modify {b.id} <new_price>    "
+            f"{b.symbol} {b.side} (current cancel: {b.cancel_price})"
+        )
+    lines.append("</pre>")
+    await query.message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ----- Statistics submenu ---------------------------------------------------
 
 
 @router.callback_query(F.data == CB_MENU_STATS)
@@ -154,16 +234,10 @@ async def menu_stats(query: CallbackQuery) -> None:
     if query.message is None:
         return
     await query.message.answer(
-        "Pick a window:",
+        "📊 <b>Statistika</b> — pick a window:",
+        parse_mode=ParseMode.HTML,
         reply_markup=stats_window_keyboard(),
     )
-
-
-@router.callback_query(F.data == CB_MENU_REPORTS)
-async def menu_reports(query: CallbackQuery) -> None:
-    await query.answer()
-    if query.message is not None:
-        await _send_reports(query.message, days=7)
 
 
 @router.callback_query(F.data == CB_MENU_BALANCE)
@@ -175,23 +249,25 @@ async def menu_balance(
         await cmd_balance(query.message, client)
 
 
-@router.callback_query(F.data == CB_MENU_HELP)
-async def menu_help(query: CallbackQuery) -> None:
-    await query.answer()
-    if query.message is not None:
-        await cmd_help(query.message)
-
-
 # Time-window quick picks under /stats menu
 @router.callback_query(
-    F.data.in_({CB_STATS_TODAY, CB_STATS_7D, CB_STATS_30D, CB_STATS_ALL})
+    F.data.in_(
+        {
+            CB_STATS_TODAY,
+            CB_STATS_7D,
+            CB_STATS_30D,
+            CB_STATS_3MO,
+            CB_STATS_6MO,
+            CB_STATS_1Y,
+            CB_STATS_ALL,
+        }
+    )
 )
 async def stats_window(query: CallbackQuery) -> None:
     await query.answer()
     if query.message is None:
         return
-    days_token = query.data.split(":", 1)[1]
-    days_int = int(days_token)
+    days_int = int(query.data.split(":", 1)[1])
     days = days_int if days_int > 0 else None
     await _send_stats(query.message, days=days)
 
@@ -257,6 +333,48 @@ async def cmd_cancel(message: Message, engine: BlockEngine) -> None:
         return
     await engine.cancel_block(block_id)
     await message.answer(f"Requested manual close for block #{block_id}.")
+
+
+@router.message(Command("modify"))
+async def cmd_modify(message: Message, engine: BlockEngine) -> None:
+    """Change the cancel price of an active block.
+
+    Only valid while no rung has triggered yet — past that point the
+    cancel-price rule no longer applies. New price must keep the same
+    side relationship with the ladder (above all entries for BUY,
+    below all entries for SELL).
+    """
+    text = (message.text or "").strip()
+    parts = text.split()
+    if len(parts) < 3:
+        await _reply_plain(
+            message,
+            "Usage: /modify <block_id> <new_cancel_price>"
+        )
+        return
+    try:
+        block_id = int(parts[1])
+        new_cancel = float(parts[2])
+    except ValueError:
+        await _reply_plain(
+            message,
+            "Both block_id and new_cancel_price must be numbers."
+        )
+        return
+
+    try:
+        await engine.modify_cancel_price(block_id, new_cancel)
+    except ValueError as exc:
+        await _reply_plain(message, f"❌ {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("modify_cancel_price failed")
+        await _reply_plain(message, f"❌ {exc}")
+        return
+
+    await message.answer(
+        f"✅ Block #{block_id}: cancel price updated to {new_cancel}."
+    )
 
 
 @router.message(Command("stats"))

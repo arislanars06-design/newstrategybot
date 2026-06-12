@@ -43,6 +43,7 @@ class EventType(StrEnum):
     """Audit-log event types."""
 
     BLOCK_CREATED = "BLOCK_CREATED"
+    BLOCK_MODIFIED = "BLOCK_MODIFIED"
     ORDERS_PLACED = "ORDERS_PLACED"
     ORDER_TRIGGERED = "ORDER_TRIGGERED"
     TP_HIT = "TP_HIT"

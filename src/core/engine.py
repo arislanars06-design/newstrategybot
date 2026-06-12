@@ -410,6 +410,63 @@ class BlockEngine:
                 payload={},
             )
 
+    async def modify_cancel_price(
+        self, block_id: int, new_cancel_price: float
+    ) -> None:
+        """Update the cancel price of an active block.
+
+        Only allowed while the block is still ACTIVE *and* its cancel
+        price is still active (no rung has triggered yet) — once a
+        position has been opened, the cancel-price rule no longer
+        applies and modifying it would be misleading.
+
+        The new price must be on the correct side of the ladder:
+        above the highest entry for BUY blocks, below the lowest
+        entry for SELL blocks.
+        """
+        async with self._lock_for(block_id):
+            async with session_scope() as session:
+                block = await repository.get_block(session, block_id)
+                if block is None:
+                    raise ValueError(f"Block #{block_id} not found.")
+                if block.is_terminal:
+                    raise ValueError(
+                        f"Block #{block_id} is already in a terminal state "
+                        f"({block.status}); cancel price cannot be changed."
+                    )
+                if not block.cancel_price_active:
+                    raise ValueError(
+                        "A position has already opened in this block; the "
+                        "cancel-price rule no longer applies."
+                    )
+
+                entries = [o.entry_price for o in block.orders]
+                if block.side == BlockSide.BUY:
+                    if new_cancel_price <= max(entries):
+                        raise ValueError(
+                            f"BUY block: cancel price must be > the highest "
+                            f"entry ({max(entries)})."
+                        )
+                else:
+                    if new_cancel_price >= min(entries):
+                        raise ValueError(
+                            f"SELL block: cancel price must be < the lowest "
+                            f"entry ({min(entries)})."
+                        )
+
+                old_cancel = block.cancel_price
+                block.cancel_price = new_cancel_price
+                await repository.add_event(
+                    session,
+                    block_id=block_id,
+                    event_type=EventType.BLOCK_MODIFIED,
+                    payload={
+                        "field": "cancel_price",
+                        "old": old_cancel,
+                        "new": new_cancel_price,
+                    },
+                )
+
     # ----- WebSocket handlers -----
 
     async def _handle_order_update(self, update: OrderUpdate) -> None:

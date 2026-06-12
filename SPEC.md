@@ -178,11 +178,37 @@ previews.
 /list        — active blocks (one line each)
 /block <id>  — full detail view (with live PnL)
 /cancel <id> — manually close a block
-/stats [w]   — aggregate stats (today | 7 | 30 | all)
+/modify <id> <new_cancel_price> — change cancel price of an active block
+/stats [w]   — aggregate stats (today | 7 | 30 | 90 | 180 | 365 | all)
 /reports [d] — per-day breakdown for the last d days (default 7)
 /balance     — wallet USDT balance
+/raw <symbol>— diagnostic: dump every open order on a symbol
 /help        — list commands
 ```
+
+### Menu structure
+
+```
+📦 Block
+   ➕ Yaratish      → /track flow
+   📋 Aktiv bloklar → /list
+   ✋ Bekor qilish  → /cancel <id>
+   ✏️ O'zgartirish  → /modify <id> <new_price>
+   ⬅️ Orqaga
+📊 Statistika
+   Today   7d   30d
+   3mo     6mo  1y
+   All     ⬅️ Orqaga
+💰 Balans
+```
+
+`/modify` is only valid while the cancel-price rule is still active —
+i.e. before any rung has triggered. After the first fill, modifying
+the cancel price would be misleading because the rule no longer
+applies, so the engine refuses. Attempts on terminal blocks are
+rejected with the current status quoted back. New cancel price must
+remain on the correct side of the ladder (above all entries for BUY,
+below all entries for SELL).
 
 ### Active block view (matches the trader's spec)
 
