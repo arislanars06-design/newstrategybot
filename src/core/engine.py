@@ -1034,10 +1034,22 @@ class BlockEngine:
     ) -> bool:
         """Cancel a single child order, picking the right identifier.
 
-        Managed blocks (placed by /newblock) always carry a predictable
-        client_order_id, so we cancel by client_id. Tracked blocks
-        (adopted via /track) have arbitrary user-defined client IDs, so
-        we cancel by Binance ``orderId`` instead.
+        We always prefer the exchange ID (orderId or algoId) when it's
+        available because :meth:`BinanceClient.cancel_order_by_exchange_id`
+        is symmetric across regular and conditional/algo orders — it
+        tries the regular cancel endpoint first and falls back through
+        the algo cancel endpoint when Binance reports -2011. The
+        client_id route is a safety net only: it covers the brief
+        window between persisting an order row and Binance returning
+        the exchange ID, plus the rare case where placement somehow
+        succeeded without us recording the exchange ID.
+
+        Note: for managed blocks Binance auto-renames the
+        client_order_id of conditional orders to ``x-Cb7ytek...`` (an
+        internal broker prefix), so a cancel-by-client-id with our
+        original ``blkN-sM-l`` value would never match. That's the
+        bug the trader reported — cancel-by-exchange-id sidesteps it
+        entirely.
         """
         if kind == "e":
             client_id = order.entry_client_id
@@ -1052,10 +1064,6 @@ class BlockEngine:
             return False
 
         try:
-            if block.is_managed and client_id:
-                return await self._client.cancel_order_by_client_id(
-                    block.symbol, client_id
-                )
             if exchange_id:
                 return await self._client.cancel_order_by_exchange_id(
                     block.symbol, exchange_id
