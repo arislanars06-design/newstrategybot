@@ -653,7 +653,7 @@ class BlockEngine:
             await repository.deactivate_cancel_price(session, block)
 
         # Place TP and SL for this specific order.
-        await self._place_tp_sl(session, block, order)
+        await self._place_tp_only(session, block, order)
 
         await self._notify(
             type_=NotificationType.ORDER_TRIGGERED,
@@ -874,7 +874,26 @@ class BlockEngine:
     # ----- Exchange helpers -----
 
     async def _place_entry_orders(self, block_id: int, plan: BlockPlan) -> None:
+        """Place entry LIMITs **and** SL STOP_MARKETs upfront for every rung.
+
+        Pre-placing SLs makes the trader's whole risk plan visible on
+        Binance immediately, which matches their mental model of how
+        the strategy should appear on the chart.
+
+        TPs are still placed lazily (in :meth:`_on_entry_filled`) — for
+        a typical Fibonacci ladder the TP stopPrice often sits on the
+        already-passed side of current market (e.g. a LONG TP at 103
+        when the market is at 105) and Binance rejects such orders
+        with "would trigger immediately". Once an entry actually fills
+        the market is at or near the entry price, so TP stopPrices
+        ahead of the trade direction become safe to register.
+
+        If SL placement fails for a rung we cancel that rung's entry
+        we just placed, so the engine never leaves dangling entries
+        without their matching SL.
+        """
         side = _entry_side_for(plan.side)
+        exit_side = _exit_side_for(plan.side)
         position_side = _position_side_for(plan.side)
 
         async with session_scope() as session:
@@ -883,15 +902,14 @@ class BlockEngine:
             orders = list(block.orders)
 
         for order in orders:
-            client_id = order.entry_client_id
             try:
-                exch_id = await self._client.place_entry_limit(
+                entry_id = await self._client.place_entry_limit(
                     symbol=plan.symbol,
                     side=side,
                     position_side=position_side,
                     qty=order.qty,
                     price=order.entry_price,
-                    client_id=client_id,
+                    client_id=order.entry_client_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error(
@@ -899,17 +917,51 @@ class BlockEngine:
                     b=block_id, s=order.seq, err=exc,
                 )
                 raise
+
+            try:
+                sl_id = await self._client.place_sl_stop(
+                    symbol=plan.symbol,
+                    side=exit_side,
+                    position_side=position_side,
+                    qty=order.qty,
+                    stop_price=order.sl_price,
+                    client_id=order.sl_client_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Upfront SL placement failed for block={b} seq={s}: {err}; "
+                    "cancelling the just-placed entry to keep state consistent.",
+                    b=block_id, s=order.seq, err=exc,
+                )
+                # Roll back the matching entry so we don't leave it dangling.
+                try:
+                    await self._client.cancel_order_by_client_id(
+                        plan.symbol, order.entry_client_id
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("rollback cancel of entry also failed; ignoring")
+                raise
+
             async with session_scope() as session:
                 fresh = await repository.get_block(session, block_id)
                 assert fresh is not None
                 target = next(o for o in fresh.orders if o.seq == order.seq)
-                await repository.set_order_exchange_ids(session, target, entry_id=exch_id)
+                await repository.set_order_exchange_ids(
+                    session, target, entry_id=entry_id, sl_id=sl_id
+                )
             await asyncio.sleep(self._settings.order_place_delay_ms / 1000.0)
 
-    async def _place_tp_sl(
+    async def _place_tp_only(
         self, session: AsyncSession, block: Block, order: Order
     ) -> None:
-        """Place TP + SL pair sized to a single rung's quantity."""
+        """Place the rung's TP after its entry has filled.
+
+        SL is already on the book from the upfront placement done in
+        :meth:`_place_entry_orders`, so this only needs to add the TP.
+        On failure the rung is parked in ``ERROR`` state and an
+        audit-log entry is written; the SL stays where it is so the
+        position is never left without protection.
+        """
         exit_side = _exit_side_for(block.side)
         position_side = _position_side_for(block.side)
 
@@ -922,17 +974,9 @@ class BlockEngine:
                 price=order.tp_price,
                 client_id=order.tp_client_id,
             )
-            sl_id = await self._client.place_sl_stop(
-                symbol=block.symbol,
-                side=exit_side,
-                position_side=position_side,
-                qty=order.qty,
-                stop_price=order.sl_price,
-                client_id=order.sl_client_id,
-            )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
-                "TP/SL placement failed for block={b} seq={s}", b=block.id, s=order.seq
+                "TP placement failed for block={b} seq={s}", b=block.id, s=order.seq
             )
             await repository.update_order_state(session, order, OrderState.ERROR)
             await repository.add_event(
@@ -940,18 +984,25 @@ class BlockEngine:
                 block_id=block.id,
                 order_seq=order.seq,
                 event_type=EventType.BLOCK_ERROR,
-                payload={"stage": "tp_sl_placement", "error": str(exc)},
+                payload={"stage": "tp_placement", "error": str(exc)},
             )
             return
 
-        await repository.set_order_exchange_ids(session, order, tp_id=tp_id, sl_id=sl_id)
+        await repository.set_order_exchange_ids(session, order, tp_id=tp_id)
 
     async def _cancel_pending_entries(
         self, session: AsyncSession, block: Block
     ) -> None:
+        """Cancel every still-pending rung's entry **and** its upfront SL.
+
+        Called when the block reaches a terminal state via WIN. The
+        SL was placed upfront, so leaving it on the book after the
+        block is closed would be a stray order — cancel it here.
+        """
         pendings = [o for o in block.orders if o.state == OrderState.PENDING]
         for order in pendings:
             await self._cancel_one_order(block, order, "e")
+            await self._cancel_one_order(block, order, "l")
             await repository.update_order_state(session, order, OrderState.CANCELLED)
             await repository.add_event(
                 session,
