@@ -77,6 +77,25 @@ def _format_rate_limit_error(exc: BinanceAPIException) -> str:
 # contributed to the rate-limit ban.
 _LEVERAGE_TTL_SECONDS = 300.0
 
+
+def _extract_order_id(response: Any, client_id: str, *, kind: str) -> str:
+    """Pull the exchange ``orderId`` out of a Binance order response.
+
+    Wraps the raw ``response["orderId"]`` access so that an unexpected
+    response shape (missing field, error dict that wasn't raised as an
+    exception, partial response on a retry) produces a clear, debuggable
+    error instead of a bare ``KeyError('orderId')`` propagating up to
+    Telegram. Includes the response itself in the message so the trader
+    (or me reading their VPS log) can see exactly what Binance sent.
+    """
+    if isinstance(response, dict) and "orderId" in response:
+        return str(response["orderId"])
+    raise RuntimeError(
+        f"Binance {kind} placement (client_id={client_id}) returned an "
+        f"unexpected response with no 'orderId' field: "
+        f"type={type(response).__name__}, value={response!r}"
+    )
+
 # Side / positionSide constants mirrored from Binance docs to avoid magic strings.
 SIDE_BUY = "BUY"
 SIDE_SELL = "SELL"
@@ -305,7 +324,7 @@ class BinanceClient:
             price=self.normalize_price(symbol, price),
             newClientOrderId=client_id,
         )
-        return str(order["orderId"])
+        return _extract_order_id(order, client_id, kind="entry")
 
     @retry(
         retry=retry_if_exception(_is_retryable_binance_error),
@@ -340,7 +359,7 @@ class BinanceClient:
             price=self.normalize_price(symbol, price),
             newClientOrderId=client_id,
         )
-        return str(order["orderId"])
+        return _extract_order_id(order, client_id, kind="tp")
 
     @retry(
         retry=retry_if_exception(_is_retryable_binance_error),
@@ -370,7 +389,7 @@ class BinanceClient:
             workingType=WORKING_TYPE_MARK,
             newClientOrderId=client_id,
         )
-        return str(order["orderId"])
+        return _extract_order_id(order, client_id, kind="sl")
 
     # ----- Order cancellation -----
 
