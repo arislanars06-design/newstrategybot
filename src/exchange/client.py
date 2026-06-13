@@ -7,6 +7,7 @@ cached symbol filters.
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -15,7 +16,7 @@ from binance.exceptions import BinanceAPIException
 from loguru import logger
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -23,6 +24,58 @@ from tenacity import (
 from src.config import Settings
 from src.exchange.normalize import format_decimal, round_to_step
 from src.exchange.types import SymbolFilters
+
+
+# Binance rate-limit / IP-ban codes that we should NOT retry on. Burning
+# more requests against an already-banned IP only extends the ban.
+RATE_LIMIT_CODES = {-1003, -1015, -1418}
+
+
+def _is_retryable_binance_error(exc: BaseException) -> bool:
+    """Return True for transient Binance failures worth retrying.
+
+    Anything is retryable EXCEPT the rate-limit / IP-ban family — the
+    REST API itself is telling us 'stop hitting me', so retry would
+    actively make things worse.
+    """
+    if not isinstance(exc, BinanceAPIException):
+        return False
+    return exc.code not in RATE_LIMIT_CODES
+
+
+def _format_rate_limit_error(exc: BinanceAPIException) -> str:
+    """Surface a friendly explanation of a -1003 IP-ban response.
+
+    The raw message Binance returns embeds the unban timestamp in
+    milliseconds. Pulling it out and showing a wall-clock time helps
+    the trader understand exactly when they can retry.
+    """
+    raw = str(exc)
+    import re
+    m = re.search(r"banned until (\d{10,})", raw)
+    if not m:
+        return f"Binance rate-limit: {raw}"
+    try:
+        ts_ms = int(m.group(1))
+        from datetime import datetime, timezone
+        unban = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
+        seconds_left = max(0, int((unban - now).total_seconds()))
+        return (
+            f"Binance has temporarily banned this IP for sending too many "
+            f"requests. Ban ends at {unban:%Y-%m-%d %H:%M:%S UTC} "
+            f"(~{seconds_left // 60} min {seconds_left % 60} sec from now). "
+            "Wait it out, then retry."
+        )
+    except Exception:  # noqa: BLE001
+        return f"Binance rate-limit: {raw}"
+
+
+# Leverage values change rarely (only when the trader edits them in the
+# Binance UI), so it's safe to cache them for a few minutes. Each /fib
+# call would otherwise round-trip futures_position_information, which
+# contributed to the rate-limit ban.
+_LEVERAGE_TTL_SECONDS = 300.0
 
 # Side / positionSide constants mirrored from Binance docs to avoid magic strings.
 SIDE_BUY = "BUY"
@@ -43,6 +96,8 @@ class BinanceClient:
         self._settings = settings
         self._client: AsyncClient | None = None
         self._symbol_filters: dict[str, SymbolFilters] = {}
+        # (symbol, position_side) -> (leverage, expires_at_monotonic)
+        self._leverage_cache: dict[tuple[str, str], tuple[int, float]] = {}
 
     # ----- Lifecycle -----
 
@@ -178,24 +233,52 @@ class BinanceClient:
     async def get_leverage(self, symbol: str, position_side: str) -> int:
         """Return the leverage configured on Binance for the symbol+side.
 
-        Used by the Fibonacci block flow so the trader doesn't have to
-        repeat the leverage they already configured on the exchange.
+        Cached for 5 minutes. The trader rarely changes leverage from
+        Binance UI, so /fib calls don't need to round-trip the REST
+        API every time. Repeated calls (one per /fib confirm step,
+        plus the smoke testing the trader is doing) were the most
+        likely contributor to the IP-ban rate-limit incident.
+
         Falls back to 10x if the position record is missing or the
-        leverage field is unparseable — that's the Binance default for
-        new symbols and a sane choice when something looks off.
+        leverage field is unparseable — that's the Binance default
+        for new symbols and a sane choice when something looks off.
         """
+        cache_key = (symbol, position_side)
+        cached = self._leverage_cache.get(cache_key)
+        now = time.monotonic()
+        if cached is not None and cached[1] > now:
+            return cached[0]
+
         pos = await self.get_position(symbol, position_side)
         if pos is None:
-            return 10
-        try:
-            return int(pos.get("leverage", 10))
-        except (TypeError, ValueError):
-            return 10
+            leverage = 10
+        else:
+            try:
+                leverage = int(pos.get("leverage", 10))
+            except (TypeError, ValueError):
+                leverage = 10
+
+        self._leverage_cache[cache_key] = (leverage, now + _LEVERAGE_TTL_SECONDS)
+        return leverage
+
+    def invalidate_leverage_cache(
+        self, symbol: str | None = None, position_side: str | None = None
+    ) -> None:
+        """Drop cached leverage entries.
+
+        Called after :meth:`set_leverage` so the next read pulls a
+        fresh value. With both arguments it scopes to a single key,
+        otherwise wipes the whole cache.
+        """
+        if symbol is None or position_side is None:
+            self._leverage_cache.clear()
+            return
+        self._leverage_cache.pop((symbol, position_side), None)
 
     # ----- Order placement -----
 
     @retry(
-        retry=retry_if_exception_type(BinanceAPIException),
+        retry=retry_if_exception(_is_retryable_binance_error),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=0.5, max=4),
         reraise=True,
@@ -225,7 +308,7 @@ class BinanceClient:
         return str(order["orderId"])
 
     @retry(
-        retry=retry_if_exception_type(BinanceAPIException),
+        retry=retry_if_exception(_is_retryable_binance_error),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=0.5, max=4),
         reraise=True,
@@ -260,7 +343,7 @@ class BinanceClient:
         return str(order["orderId"])
 
     @retry(
-        retry=retry_if_exception_type(BinanceAPIException),
+        retry=retry_if_exception(_is_retryable_binance_error),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=0.5, max=4),
         reraise=True,

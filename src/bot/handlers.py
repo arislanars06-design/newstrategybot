@@ -57,7 +57,12 @@ from src.core.engine import BlockEngine
 from src.core.fib import compute_fib_plan
 from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan
 from src.db import BlockSide, repository, session_scope
-from src.exchange.client import BinanceClient
+from src.exchange.client import (
+    RATE_LIMIT_CODES,
+    BinanceClient,
+    _format_rate_limit_error,
+)
+from binance.exceptions import BinanceAPIException
 
 router = Router(name="newstrategybot")
 
@@ -456,6 +461,13 @@ async def cmd_raw(message: Message, client: BinanceClient) -> None:
     symbol = parts[1].upper()
     try:
         orders = await client.list_open_orders(symbol)
+    except BinanceAPIException as exc:
+        if exc.code in RATE_LIMIT_CODES:
+            await _reply_plain(message, _format_rate_limit_error(exc))
+            return
+        logger.exception("list_open_orders failed")
+        await _reply_plain(message, f"Failed to fetch orders for {symbol}: {exc}")
+        return
     except Exception as exc:  # noqa: BLE001
         logger.exception("list_open_orders failed")
         await _reply_plain(message, f"Failed to fetch orders for {symbol}: {exc}")
@@ -999,6 +1011,17 @@ async def fib_cancel_price(
     # back to 10x silently — get_leverage already does that.
     try:
         leverage = await client.get_leverage(symbol, pos_side)
+    except BinanceAPIException as exc:
+        if exc.code in RATE_LIMIT_CODES:
+            await _reply_plain(message, _format_rate_limit_error(exc))
+            await state.clear()
+            return
+        logger.exception("get_leverage failed")
+        await _reply_plain(
+            message, f"❌ Could not read leverage for {symbol}: {exc}"
+        )
+        await state.clear()
+        return
     except Exception as exc:  # noqa: BLE001
         logger.exception("get_leverage failed")
         await _reply_plain(
