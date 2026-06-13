@@ -351,3 +351,71 @@ def render_notification(n: Notification) -> str:
     if n.type == NotificationType.BLOCK_MANUAL_CLOSE:
         return f"✋ <b>BLOCK #{n.block_id}</b> closed manually."
     return f"BLOCK #{n.block_id} — {n.type}: {n.payload}"
+
+
+
+# =============================================================================
+# /fib — Fibonacci plan preview
+# =============================================================================
+
+
+def format_fib_plan_preview(
+    symbol: str,
+    side: Any,
+    rungs: list[Any],          # list[FibRungComputed]
+    *,
+    zero_price: float,
+    hundred_price: float,
+    cancel_price: float,
+    leverage: float,
+    first_risk_usd: float,
+) -> str:
+    """Render the per-rung Fibonacci plan with totals.
+
+    ``rungs`` are the dataclass objects returned by
+    :func:`src.core.fib.compute_fib_plan`. We type-erase to ``Any`` here
+    to avoid pulling the import into the formatter module — the
+    duck-typing lets the function stay independent of model layout.
+    """
+    side_str = str(side)
+    range_size = hundred_price - zero_price
+
+    lines = [
+        f"📋 <b>Fib plan</b> — <code>{symbol}</code> <b>{side_str}</b>",
+        f"Range: <code>{zero_price}</code> (0%) → "
+        f"<code>{hundred_price}</code> (100%)  "
+        f"Δ {range_size:+.2f}",
+        f"First risk: <code>{first_risk_usd}</code> USDT  "
+        f"Leverage: <code>{leverage}x</code>  "
+        f"Cancel price: <code>{cancel_price}</code>",
+        "",
+        "<pre>",
+        f"{'#':>2} {'entry':>10} {'tp':>10} {'sl':>10} "
+        f"{'qty':>10} {'risk$':>7} {'sl%':>5}",
+    ]
+    total_risk = 0.0
+    total_margin = 0.0
+    total_pos = 0.0
+    for r in rungs:
+        lines.append(
+            f"{r.seq:>2} "
+            f"{round(r.entry, 4):>10} "
+            f"{round(r.tp, 4):>10} "
+            f"{round(r.sl, 4):>10} "
+            f"{round(r.qty, 6):>10} "
+            f"{round(r.risk_usd, 2):>7} "
+            f"{round(r.sl_pct, 2):>5}"
+        )
+        total_risk += r.risk_usd
+        total_margin += r.margin
+        total_pos += r.pos_size
+    lines.append("</pre>")
+    lines.extend([
+        "",
+        f"<b>Total max risk:</b> <code>{round(total_risk, 2)}</code> USDT  "
+        "(if every SL fires)",
+        f"<b>Total margin:</b> <code>{round(total_margin, 2)}</code> USDT  "
+        "(collateral required)",
+        f"<b>Total notional:</b> <code>{round(total_pos, 2)}</code> USDT",
+    ])
+    return "\n".join(lines)

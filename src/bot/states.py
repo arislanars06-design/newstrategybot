@@ -30,3 +30,20 @@ class TrackBlockFSM(StatesGroup):
     DISCOVERED = State()
     CANCEL_PRICE = State()
     CONFIRM = State()
+
+
+class FibBlockFSM(StatesGroup):
+    """Bot-driven block creation from Fibonacci levels.
+
+    The trader supplies five values; the bot computes everything else
+    (entries, TPs, SLs, per-rung qty) from those plus the leverage it
+    reads from Binance for the symbol+side.
+    """
+
+    SYMBOL = State()
+    SIDE = State()
+    ZERO_PRICE = State()
+    HUNDRED_PRICE = State()
+    FIRST_RISK = State()
+    CANCEL_PRICE = State()
+    CONFIRM = State()

@@ -175,6 +175,23 @@ class BinanceClient:
                 return p
         return None
 
+    async def get_leverage(self, symbol: str, position_side: str) -> int:
+        """Return the leverage configured on Binance for the symbol+side.
+
+        Used by the Fibonacci block flow so the trader doesn't have to
+        repeat the leverage they already configured on the exchange.
+        Falls back to 10x if the position record is missing or the
+        leverage field is unparseable — that's the Binance default for
+        new symbols and a sane choice when something looks off.
+        """
+        pos = await self.get_position(symbol, position_side)
+        if pos is None:
+            return 10
+        try:
+            return int(pos.get("leverage", 10))
+        except (TypeError, ValueError):
+            return 10
+
     # ----- Order placement -----
 
     @retry(

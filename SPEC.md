@@ -61,17 +61,52 @@ applies.
 
 ## 3. Block creation paths
 
-Two equivalent ways to bring a block into existence. Both end with the
-same DB rows and watcher subscriptions.
+Three equivalent ways to bring a block into existence. All end with
+the same DB rows and watcher subscriptions.
 
-### `/newblock` — bot places the orders
+### `/fib` — bot computes the ladder from Fibonacci levels (primary)
+
+This is the trader's preferred workflow and the one the **Yaratish**
+menu button drives. The trader supplies five values:
+
+1. Symbol and side (BUY / SELL)
+2. The 0% anchor price
+3. The 100% anchor price
+4. The first rung's risk in USDT
+5. The cancel ("price invalid") price
+
+Every other number is derived. The bot:
+
+* Computes 8 entry prices at Fibonacci levels **68.1, 70.2, 78.6,
+  89.3, 100, 111.8, 123.6 and 130.9 percent** of the user-supplied
+  range.
+* Chains stop-losses so each rung's SL equals the next rung's entry;
+  the eighth rung's SL sits at level 138.2% — one Fib step beyond
+  the last entry.
+* Sizes each rung's USD risk via a geometric 1.5× progression from
+  the trader's first-rung input. Total max risk across the ladder is
+  approximately **49.26 ×** the first-rung risk.
+* Sets per-rung TP ratios at **1:5 for rungs 1–3, then 5.64, 6.42,
+  6.95, 7.30 and 7.53** for rungs 4–8.
+* Reads the current symbol leverage straight from Binance (one less
+  question for the trader) and computes per-rung margin via the
+  trader's formula: `margin = risk × 100 / (sl_pct × leverage)`.
+* Quantity is then `pos_size / entry`, where `pos_size = margin ×
+  leverage`.
+
+The preview screen shows the entire ladder plus totals (max risk,
+collateral required, notional). On confirmation the engine places
+all 24 orders (8 entries + 8 TPs + 8 SLs) in a single batch through
+the same `engine.create_block()` path used by `/newblock`.
+
+### `/newblock` — bot places explicit prices
 
 The trader drives an FSM through Telegram (symbol → side → 8 entries
-→ 8 TPs → last SL → cancel price → qty). The engine validates the
-plan, persists it, and then sends each order to Binance. Cleanup is
-automatic if any placement fails.
+→ 8 TPs → last SL → cancel price → qty). Useful when the trader
+wants prices that don't fit a Fibonacci grid. The engine validates
+the plan, persists it, and then sends each order to Binance.
 
-### `/track` — bot adopts existing orders
+### `/track` — bot adopts orders the trader placed manually
 
 The trader places the 8 entries (each with its own TP and SL) directly
 on Binance or via TradingView's trading panel, then runs `/track`. The
@@ -79,7 +114,9 @@ engine reads the open-orders list, classifies orders into entry / TP
 / SL buckets, pairs them by quantity + price index, and shows the
 proposed ladder for confirmation. The trader only types the
 `cancel_price`. Already-adopted orders are filtered out so multiple
-blocks can coexist on the same symbol.
+blocks can coexist on the same symbol. Side is auto-detected from the
+unassigned LIMIT entries — manual selection is offered only when the
+side is ambiguous (e.g. eight unassigned entries on each side).
 
 ---
 
@@ -173,7 +210,8 @@ previews.
 
 ```
 /menu        — main menu (inline keyboard)
-/newblock    — create a new block (bot places orders)
+/fib         — Fibonacci-driven block creation (bot computes the ladder)
+/newblock    — create a block from explicit prices (bot places orders)
 /track       — adopt orders you placed manually
 /list        — active blocks (one line each)
 /block <id>  — full detail view (with live PnL)
@@ -190,7 +228,7 @@ previews.
 
 ```
 📦 Block
-   ➕ Yaratish      → /track flow
+   ➕ Yaratish      → /fib  (Fibonacci ladder — primary)
    📋 Aktiv bloklar → /list
    ✋ Bekor qilish  → /cancel <id>
    ✏️ O'zgartirish  → /modify <id> <new_price>
@@ -316,6 +354,7 @@ The trader supplies the strategy. The bot supplies the discipline.
 | Concern                        | Module                              |
 |--------------------------------|-------------------------------------|
 | Validated plan + chain helper  | `src/core/plan.py`                  |
+| Fibonacci ladder generator     | `src/core/fib.py`                   |
 | State machine + WS routing     | `src/core/engine.py`                |
 | `/track` discovery + grouping  | `src/core/tracker.py`               |
 | Risk math                      | `src/core/risk.py`                  |

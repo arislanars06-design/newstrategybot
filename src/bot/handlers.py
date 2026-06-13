@@ -20,6 +20,7 @@ from src.bot.formatters import (
     format_balance,
     format_block_detail,
     format_block_summary,
+    format_fib_plan_preview,
     format_plan_preview,
     format_report,
     format_stats,
@@ -51,8 +52,9 @@ from src.bot.keyboards import (
     side_keyboard,
     stats_window_keyboard,
 )
-from src.bot.states import NewBlockFSM, TrackBlockFSM
+from src.bot.states import FibBlockFSM, NewBlockFSM, TrackBlockFSM
 from src.core.engine import BlockEngine
+from src.core.fib import compute_fib_plan
 from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan
 from src.db import BlockSide, repository, session_scope
 from src.exchange.client import BinanceClient
@@ -158,11 +160,12 @@ async def menu_block(query: CallbackQuery) -> None:
 async def block_create(query: CallbackQuery, state: FSMContext) -> None:
     await query.answer()
     if query.message is not None:
-        # Yaratish = adopt user-placed orders via /track. /newblock is
-        # still available as a command for traders who want the bot to
-        # place the orders for them, but the trader's spec uses
-        # manual placement + bot tracking, so the menu surfaces /track.
-        await cmd_track(query.message, state)
+        # Yaratish = the Fibonacci-driven block creation flow. /track
+        # and /newblock remain available as commands for traders who
+        # prefer manual placement or who want the bot to place explicit
+        # prices, but the menu surface is the Fib path because that is
+        # the trader's primary workflow.
+        await cmd_fib(query.message, state)
 
 
 @router.callback_query(F.data == CB_BLOCK_LIST)
@@ -869,6 +872,229 @@ async def track_confirm(
 
     await query.message.answer(
         f"✅ Block <b>#{block.id}</b> is now tracked. Status: ACTIVE",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.clear()
+
+
+
+# =============================================================================
+# /fib — bot-driven block creation from Fibonacci levels
+# =============================================================================
+
+
+@router.message(Command("fib"))
+async def cmd_fib(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(FibBlockFSM.SYMBOL)
+    await message.answer(
+        "Step 1/6 — send the symbol (e.g. <code>BTCUSDT</code>).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(FibBlockFSM.SYMBOL, F.text)
+async def fib_symbol(message: Message, state: FSMContext) -> None:
+    symbol = (message.text or "").strip().upper()
+    if not symbol.isalnum() or len(symbol) < 4:
+        await message.answer("Invalid symbol. Try again.")
+        return
+    await state.update_data(symbol=symbol)
+    await state.set_state(FibBlockFSM.SIDE)
+    await message.answer(
+        "Step 2/6 — choose side:",
+        reply_markup=side_keyboard(),
+    )
+
+
+@router.callback_query(FibBlockFSM.SIDE, F.data.in_({CB_SIDE_BUY, CB_SIDE_SELL}))
+async def fib_side(query: CallbackQuery, state: FSMContext) -> None:
+    side = BlockSide.BUY if query.data == CB_SIDE_BUY else BlockSide.SELL
+    await state.update_data(side=str(side))
+    await state.set_state(FibBlockFSM.ZERO_PRICE)
+    if query.message is not None:
+        await query.message.answer(
+            "Step 3/6 — send the <b>0%</b> anchor price.\n"
+            "For BUY blocks pick the high (top of the move); the "
+            "ladder will descend from there. For SELL blocks pick "
+            "the low; the ladder will ascend.",
+            parse_mode=ParseMode.HTML,
+        )
+    await query.answer()
+
+
+def _parse_float(text: str | None) -> float | None:
+    """Lenient parser — returns None if the input isn't a positive number."""
+    if not text:
+        return None
+    try:
+        value = float(text.strip().replace(",", "."))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+@router.message(FibBlockFSM.ZERO_PRICE, F.text)
+async def fib_zero_price(message: Message, state: FSMContext) -> None:
+    value = _parse_float(message.text)
+    if value is None:
+        await message.answer("Send a positive number.")
+        return
+    await state.update_data(zero_price=value)
+    await state.set_state(FibBlockFSM.HUNDRED_PRICE)
+    await message.answer("Step 4/6 — send the <b>100%</b> anchor price.",
+                         parse_mode=ParseMode.HTML)
+
+
+@router.message(FibBlockFSM.HUNDRED_PRICE, F.text)
+async def fib_hundred_price(message: Message, state: FSMContext) -> None:
+    value = _parse_float(message.text)
+    if value is None:
+        await message.answer("Send a positive number.")
+        return
+    await state.update_data(hundred_price=value)
+    await state.set_state(FibBlockFSM.FIRST_RISK)
+    await message.answer(
+        "Step 5/6 — send the <b>first rung's risk</b> in USDT "
+        "(e.g. <code>1</code> = $1 max loss if rung 1's SL fires).\n"
+        "Subsequent rungs grow by 1.5× automatically.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(FibBlockFSM.FIRST_RISK, F.text)
+async def fib_first_risk(message: Message, state: FSMContext) -> None:
+    value = _parse_float(message.text)
+    if value is None:
+        await message.answer("Send a positive number.")
+        return
+    await state.update_data(first_risk=value)
+    await state.set_state(FibBlockFSM.CANCEL_PRICE)
+    await message.answer(
+        "Step 6/6 — send the <b>cancel price</b> (price-invalid). If "
+        "the market reaches it before any entry triggers, the whole "
+        "block is cancelled.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(FibBlockFSM.CANCEL_PRICE, F.text)
+async def fib_cancel_price(
+    message: Message,
+    state: FSMContext,
+    client: BinanceClient,
+) -> None:
+    cancel_price = _parse_float(message.text)
+    if cancel_price is None:
+        await message.answer("Send a positive number.")
+        return
+
+    data = await state.get_data()
+    symbol: str = data["symbol"]
+    side = BlockSide(data["side"])
+    pos_side = "LONG" if side == BlockSide.BUY else "SHORT"
+
+    # Pull leverage straight from Binance so the trader doesn't have
+    # to repeat what they already configured on the exchange. Fall
+    # back to 10x silently — get_leverage already does that.
+    try:
+        leverage = await client.get_leverage(symbol, pos_side)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("get_leverage failed")
+        await _reply_plain(
+            message, f"❌ Could not read leverage for {symbol}: {exc}"
+        )
+        await state.clear()
+        return
+
+    try:
+        plan, rungs = compute_fib_plan(
+            symbol=symbol,
+            side=side,
+            zero_price=data["zero_price"],
+            hundred_price=data["hundred_price"],
+            first_risk_usd=data["first_risk"],
+            leverage=leverage,
+            cancel_price=cancel_price,
+        )
+        plan.validate()
+    except ValueError as exc:
+        await _reply_plain(message, f"❌ {exc}")
+        await state.clear()
+        return
+
+    await state.update_data(
+        cancel_price=cancel_price,
+        leverage=leverage,
+    )
+    await state.set_state(FibBlockFSM.CONFIRM)
+    await message.answer(
+        format_fib_plan_preview(
+            symbol,
+            side,
+            rungs,
+            zero_price=data["zero_price"],
+            hundred_price=data["hundred_price"],
+            cancel_price=cancel_price,
+            leverage=leverage,
+            first_risk_usd=data["first_risk"],
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=confirm_keyboard(),
+    )
+
+
+@router.callback_query(FibBlockFSM.CONFIRM, F.data == CB_CANCEL)
+async def fib_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if query.message is not None:
+        await query.message.answer("Plan cancelled.")
+    await query.answer()
+
+
+@router.callback_query(FibBlockFSM.CONFIRM, F.data == CB_CONFIRM)
+async def fib_confirm(
+    query: CallbackQuery,
+    state: FSMContext,
+    engine: BlockEngine,
+) -> None:
+    if query.message is None:
+        await query.answer()
+        return
+    data = await state.get_data()
+    side = BlockSide(data["side"])
+    chat_id = query.message.chat.id
+
+    try:
+        plan, _rungs = compute_fib_plan(
+            symbol=data["symbol"],
+            side=side,
+            zero_price=data["zero_price"],
+            hundred_price=data["hundred_price"],
+            first_risk_usd=data["first_risk"],
+            leverage=data["leverage"],
+            cancel_price=data["cancel_price"],
+        )
+        plan.validate()
+    except ValueError as exc:
+        await _reply_plain(query.message, f"❌ Plan rejected: {exc}")
+        await state.clear()
+        await query.answer()
+        return
+
+    await query.message.answer("Placing 24 orders on Binance…")
+    await query.answer()
+
+    try:
+        block = await engine.create_block(plan, chat_id=chat_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("create_block failed (fib)")
+        await _reply_plain(query.message, f"❌ Failed: {exc}")
+        await state.clear()
+        return
+
+    await query.message.answer(
+        f"✅ Block <b>#{block.id}</b> placed and active.",
         parse_mode=ParseMode.HTML,
     )
     await state.clear()
