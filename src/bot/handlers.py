@@ -117,7 +117,7 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     """Minimal help — points at /menu and stays out of the way."""
     await message.answer(
-        "Open the main menu with /menu.",
+        "Откройте главное меню через /menu.",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -130,7 +130,7 @@ async def cmd_help(message: Message) -> None:
 @router.message(Command("menu"))
 async def cmd_menu(message: Message) -> None:
     await message.answer(
-        "<b>Main menu</b> — pick an action:",
+        "<b>Главное меню</b> — выберите действие:",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_keyboard(),
     )
@@ -141,7 +141,7 @@ async def menu_back(query: CallbackQuery) -> None:
     await query.answer()
     if query.message is not None:
         await query.message.answer(
-            "<b>Main menu</b>:",
+            "<b>Главное меню</b>:",
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu_keyboard(),
         )
@@ -155,7 +155,7 @@ async def menu_block(query: CallbackQuery) -> None:
     await query.answer()
     if query.message is not None:
         await query.message.answer(
-            "<b>Block</b> — pick an action:",
+            "<b>Блок</b> — выберите действие:",
             parse_mode=ParseMode.HTML,
             reply_markup=block_submenu_keyboard(),
         )
@@ -188,12 +188,12 @@ async def block_cancel_cb(query: CallbackQuery) -> None:
     async with session_scope() as session:
         active = await repository.list_active_blocks(session)
     if not active:
-        await query.message.answer("No active blocks to cancel.")
+        await query.message.answer("Нет активных блоков для отмены.")
         return
-    lines = ["✋ <b>Cancel a block</b>", "", "Pick one and run:"]
+    lines = ["✋ <b>Отменить блок</b>", "", "Выберите блок и выполните команду:"]
     lines.append("<pre>")
     for b in active:
-        lines.append(f"/cancel {b.id}    {b.symbol} {b.side} (status {b.status})")
+        lines.append(f"/cancel {b.id}    {b.symbol} {b.side} (статус {b.status})")
     lines.append("</pre>")
     await query.message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -210,20 +210,20 @@ async def block_modify_cb(query: CallbackQuery) -> None:
     ]
     if not eligible:
         await query.message.answer(
-            "No blocks with an active cancel price (modifying is only "
-            "allowed before any order has triggered)."
+            "Нет блоков с активной ценой отмены (изменить можно только "
+            "до того, как сработает первый ордер)."
         )
         return
     lines = [
-        "✏️ <b>Modify cancel price</b>",
+        "✏️ <b>Изменить цену отмены</b>",
         "",
-        "Pick one and run:",
+        "Выберите блок и выполните команду:",
         "<pre>",
     ]
     for b in eligible:
         lines.append(
-            f"/modify {b.id} <new_price>    "
-            f"{b.symbol} {b.side} (current cancel: {b.cancel_price})"
+            f"/modify {b.id} <новая_цена>    "
+            f"{b.symbol} {b.side} (текущая отмена: {b.cancel_price})"
         )
     lines.append("</pre>")
     await query.message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -238,7 +238,7 @@ async def menu_stats(query: CallbackQuery) -> None:
     if query.message is None:
         return
     await query.message.answer(
-        "📊 <b>Statistika</b> — pick a window:",
+        "📊 <b>Статистика</b> — выберите период:",
         parse_mode=ParseMode.HTML,
         reply_markup=stats_window_keyboard(),
     )
@@ -286,9 +286,9 @@ async def cmd_list(message: Message) -> None:
     async with session_scope() as session:
         active = await repository.list_active_blocks(session)
     if not active:
-        await message.answer("No active blocks.")
+        await message.answer("Нет активных блоков.")
         return
-    lines = [f"📋 Active blocks ({len(active)}):"]
+    lines = [f"📋 Активные блоки ({len(active)}):"]
     lines.extend(format_block_summary(b) for b in active)
     await _reply_html(message, "\n".join(lines))
 
@@ -298,17 +298,17 @@ async def cmd_block(message: Message, engine: BlockEngine) -> None:
     text = (message.text or "").strip()
     parts = text.split()
     if len(parts) < 2:
-        await _reply_plain(message, "Usage: /block <id>")
+        await _reply_plain(message, "Использование: /block <id>")
         return
     try:
         block_id = int(parts[1])
     except ValueError:
-        await message.answer("Block id must be an integer.")
+        await message.answer("ID блока должен быть числом.")
         return
     async with session_scope() as session:
         block = await repository.get_block(session, block_id)
     if block is None:
-        await message.answer(f"Block #{block_id} not found.")
+        await message.answer(f"Блок #{block_id} не найден.")
         return
 
     # Pull realtime PnL only for non-terminal blocks; terminal blocks
@@ -328,15 +328,15 @@ async def cmd_cancel(message: Message, engine: BlockEngine) -> None:
     text = (message.text or "").strip()
     parts = text.split()
     if len(parts) < 2:
-        await _reply_plain(message, "Usage: /cancel <id>")
+        await _reply_plain(message, "Использование: /cancel <id>")
         return
     try:
         block_id = int(parts[1])
     except ValueError:
-        await message.answer("Block id must be an integer.")
+        await message.answer("ID блока должен быть числом.")
         return
     await engine.cancel_block(block_id)
-    await message.answer(f"Requested manual close for block #{block_id}.")
+    await message.answer(f"Запрос на закрытие блока #{block_id} отправлен.")
 
 
 @router.message(Command("modify"))
@@ -353,7 +353,7 @@ async def cmd_modify(message: Message, engine: BlockEngine) -> None:
     if len(parts) < 3:
         await _reply_plain(
             message,
-            "Usage: /modify <block_id> <new_cancel_price>"
+            "Использование: /modify <id_блока> <новая_цена_отмены>"
         )
         return
     try:
@@ -362,7 +362,7 @@ async def cmd_modify(message: Message, engine: BlockEngine) -> None:
     except ValueError:
         await _reply_plain(
             message,
-            "Both block_id and new_cancel_price must be numbers."
+            "ID блока и цена отмены должны быть числами."
         )
         return
 
@@ -377,7 +377,7 @@ async def cmd_modify(message: Message, engine: BlockEngine) -> None:
         return
 
     await message.answer(
-        f"✅ Block #{block_id}: cancel price updated to {new_cancel}."
+        f"✅ Блок #{block_id}: цена отмены обновлена на {new_cancel}."
     )
 
 
@@ -398,7 +398,7 @@ async def cmd_stats(message: Message) -> None:
             except ValueError:
                 await _reply_plain(
                     message,
-                    "Usage: /stats [today | 7 | 30 | all]"
+                    "Использование: /stats [today | 7 | 30 | all]"
                 )
                 return
             days = parsed if parsed > 0 else None
@@ -416,7 +416,7 @@ async def cmd_reports(message: Message) -> None:
             if 1 <= parsed <= 90:
                 days = parsed
         except ValueError:
-            await _reply_plain(message, "Usage: /reports [days 1..90]")
+            await _reply_plain(message, "Использование: /reports [дней 1..90]")
             return
     await _send_reports(message, days=days)
 
@@ -439,7 +439,7 @@ async def cmd_balance(message: Message, client: BinanceClient) -> None:
         usdt = await client.get_balance_usdt()
     except Exception as exc:  # noqa: BLE001
         logger.exception("balance fetch failed")
-        await _reply_plain(message, f"Failed to fetch balance: {exc}")
+        await _reply_plain(message, f"Не удалось получить баланс: {exc}")
         return
     await _reply_html(message, format_balance(usdt))
 
@@ -456,7 +456,7 @@ async def cmd_raw(message: Message, client: BinanceClient) -> None:
     text = (message.text or "").strip()
     parts = text.split()
     if len(parts) < 2:
-        await _reply_plain(message, "Usage: /raw <symbol>  (e.g. /raw BTCUSDT)")
+        await _reply_plain(message, "Использование: /raw <символ>  (например, /raw BTCUSDT)")
         return
     symbol = parts[1].upper()
     try:
@@ -466,20 +466,20 @@ async def cmd_raw(message: Message, client: BinanceClient) -> None:
             await _reply_plain(message, _format_rate_limit_error(exc))
             return
         logger.exception("list_open_orders failed")
-        await _reply_plain(message, f"Failed to fetch orders for {symbol}: {exc}")
+        await _reply_plain(message, f"Не удалось получить ордера для {symbol}: {exc}")
         return
     except Exception as exc:  # noqa: BLE001
         logger.exception("list_open_orders failed")
-        await _reply_plain(message, f"Failed to fetch orders for {symbol}: {exc}")
+        await _reply_plain(message, f"Не удалось получить ордера для {symbol}: {exc}")
         return
 
     if not orders:
-        await _reply_plain(message, f"{symbol}: 0 open orders.")
+        await _reply_plain(message, f"{symbol}: 0 открытых ордеров.")
         return
 
     # Trim to the fields the tracker actually inspects so the message
     # stays under Telegram's 4 KB ceiling even with dozens of orders.
-    lines: list[str] = [f"{symbol}: {len(orders)} open order(s)"]
+    lines: list[str] = [f"{symbol}: {len(orders)} открытых ордер(ов)"]
     for o in orders:
         lines.append(
             f"  id={o.get('orderId')} type={o.get('type')} side={o.get('side')} "
@@ -505,7 +505,7 @@ async def cmd_newblock(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(NewBlockFSM.SYMBOL)
     await message.answer(
-        "Step 1/7 — send the symbol (e.g. <code>BTCUSDT</code>).",
+        "Шаг 1/7 — отправьте символ (например, <code>BTCUSDT</code>).",
         parse_mode=ParseMode.HTML,
     )
 
@@ -514,11 +514,11 @@ async def cmd_newblock(message: Message, state: FSMContext) -> None:
 async def fsm_symbol(message: Message, state: FSMContext) -> None:
     symbol = (message.text or "").strip().upper()
     if not symbol.isalnum() or len(symbol) < 4:
-        await message.answer("Invalid symbol. Try again.")
+        await message.answer("Неверный символ. Попробуйте ещё раз.")
         return
     await state.update_data(symbol=symbol)
     await state.set_state(NewBlockFSM.SIDE)
-    await message.answer("Step 2/7 — choose side:", reply_markup=side_keyboard())
+    await message.answer("Шаг 2/7 — выберите сторону:", reply_markup=side_keyboard())
 
 
 @router.callback_query(NewBlockFSM.SIDE, F.data.in_({CB_SIDE_BUY, CB_SIDE_SELL}))
@@ -527,8 +527,8 @@ async def fsm_side(query: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(side=str(side))
     await state.set_state(NewBlockFSM.ENTRIES)
     await query.message.answer(
-        f"Step 3/7 — send <b>{EXPECTED_ORDERS_PER_BLOCK}</b> entry prices, "
-        "comma-separated.\nExample: <code>100,99,98,97,96,95,94,93</code>",
+        f"Шаг 3/7 — отправьте <b>{EXPECTED_ORDERS_PER_BLOCK}</b> цен входа, "
+        "через запятую.\nПример: <code>100,99,98,97,96,95,94,93</code>",
         parse_mode=ParseMode.HTML,
     )
     await query.answer()
@@ -539,17 +539,17 @@ async def fsm_entries(message: Message, state: FSMContext) -> None:
     try:
         entries = _parse_csv_floats(message.text or "")
     except ValueError:
-        await message.answer("Could not parse numbers. Try again.")
+        await message.answer("Не удалось разобрать числа. Попробуйте ещё раз.")
         return
     if len(entries) != EXPECTED_ORDERS_PER_BLOCK:
         await message.answer(
-            f"Need exactly {EXPECTED_ORDERS_PER_BLOCK} entries, got {len(entries)}."
+            f"Нужно ровно {EXPECTED_ORDERS_PER_BLOCK} цен входа, получено {len(entries)}."
         )
         return
     await state.update_data(entries=entries)
     await state.set_state(NewBlockFSM.TPS)
     await message.answer(
-        f"Step 4/7 — send <b>{EXPECTED_ORDERS_PER_BLOCK}</b> TP prices in the same order.",
+        f"Шаг 4/7 — отправьте <b>{EXPECTED_ORDERS_PER_BLOCK}</b> цен TP в том же порядке.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -559,18 +559,18 @@ async def fsm_tps(message: Message, state: FSMContext) -> None:
     try:
         tps = _parse_csv_floats(message.text or "")
     except ValueError:
-        await message.answer("Could not parse numbers. Try again.")
+        await message.answer("Не удалось разобрать числа. Попробуйте ещё раз.")
         return
     if len(tps) != EXPECTED_ORDERS_PER_BLOCK:
         await message.answer(
-            f"Need exactly {EXPECTED_ORDERS_PER_BLOCK} TP prices, got {len(tps)}."
+            f"Нужно ровно {EXPECTED_ORDERS_PER_BLOCK} цен TP, получено {len(tps)}."
         )
         return
     await state.update_data(tps=tps)
     await state.set_state(NewBlockFSM.LAST_SL)
     await message.answer(
-        "Step 5/7 — chain mode: each SL = next entry.\n"
-        "Send the SL for the <b>last</b> order (no successor)."
+        "Шаг 5/7 — режим цепочки: SL каждого ордера = вход следующего.\n"
+        "Отправьте SL для <b>последнего</b> ордера (у него нет следующего)."
     )
 
 
@@ -579,11 +579,11 @@ async def fsm_last_sl(message: Message, state: FSMContext) -> None:
     try:
         last_sl = float((message.text or "").strip())
     except ValueError:
-        await message.answer("Send a single number.")
+        await message.answer("Отправьте одно число.")
         return
     await state.update_data(last_sl=last_sl)
     await state.set_state(NewBlockFSM.CANCEL_PRICE)
-    await message.answer("Step 6/7 — cancel price?")
+    await message.answer("Шаг 6/7 — цена отмены (price-invalid)?")
 
 
 @router.message(NewBlockFSM.CANCEL_PRICE, F.text)
@@ -591,12 +591,14 @@ async def fsm_cancel_price(message: Message, state: FSMContext) -> None:
     try:
         cancel_price = float((message.text or "").strip())
     except ValueError:
-        await message.answer("Send a single number.")
+        await message.answer("Отправьте одно число.")
         return
     await state.update_data(cancel_price=cancel_price)
     await state.set_state(NewBlockFSM.QTY)
-    await message.answer("Step 7/7 — quantity per rung (base asset, e.g. <code>0.01</code>)?",
-                         parse_mode=ParseMode.HTML)
+    await message.answer(
+        "Шаг 7/7 — объём на каждый ордер (в базовом активе, например <code>0.01</code>)?",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(NewBlockFSM.QTY, F.text)
@@ -604,10 +606,10 @@ async def fsm_qty(message: Message, state: FSMContext) -> None:
     try:
         qty = float((message.text or "").strip())
     except ValueError:
-        await message.answer("Send a single number.")
+        await message.answer("Отправьте одно число.")
         return
     if qty <= 0:
-        await message.answer("Quantity must be positive.")
+        await message.answer("Объём должен быть положительным.")
         return
     await state.update_data(qty=qty)
 
@@ -638,7 +640,7 @@ async def fsm_qty(message: Message, state: FSMContext) -> None:
 @router.callback_query(NewBlockFSM.CONFIRM, F.data == CB_CANCEL)
 async def fsm_cancel_plan(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await query.message.answer("Plan cancelled.")
+    await query.message.answer("План отменён.")
     await query.answer()
 
 
@@ -663,24 +665,24 @@ async def fsm_confirm_plan(
     try:
         plan.validate()
     except ValueError as exc:
-        await _reply_plain(query.message, f"❌ Plan rejected: {exc}")
+        await _reply_plain(query.message, f"❌ План отклонён: {exc}")
         await state.clear()
         await query.answer()
         return
 
-    await query.message.answer("Placing orders…")
+    await query.message.answer("Размещаю ордера…")
     await query.answer()
 
     try:
         block = await engine.create_block(plan, chat_id=chat_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("create_block failed")
-        await _reply_plain(query.message, f"❌ Failed: {exc}")
+        await _reply_plain(query.message, f"❌ Ошибка: {exc}")
         await state.clear()
         return
 
     await query.message.answer(
-        f"✅ Block <b>#{block.id}</b> placed and active.",
+        f"✅ Блок <b>#{block.id}</b> создан и активен.",
         parse_mode=ParseMode.HTML,
     )
     await state.clear()
@@ -697,9 +699,9 @@ async def cmd_track(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(TrackBlockFSM.SYMBOL)
     await message.answer(
-        "Step 1/2 — send the symbol whose open orders you want to adopt "
-        "(e.g. <code>BTCUSDT</code>). The bot will auto-detect the side "
-        "from your orders.",
+        "Шаг 1/2 — отправьте символ, чьи открытые ордера хотите подхватить "
+        "(например, <code>BTCUSDT</code>). Бот сам определит сторону "
+        "по вашим ордерам.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -712,7 +714,7 @@ async def track_symbol(
 ) -> None:
     symbol = (message.text or "").strip().upper()
     if not symbol.isalnum() or len(symbol) < 4:
-        await message.answer("Invalid symbol. Try again.")
+        await message.answer("Неверный символ. Попробуйте ещё раз.")
         return
     await state.update_data(symbol=symbol)
 
@@ -722,13 +724,13 @@ async def track_symbol(
         side, detect_err = await engine.auto_detect_track_side(symbol)
     except Exception as exc:  # noqa: BLE001
         logger.exception("auto_detect_track_side failed")
-        await _reply_plain(message, f"❌ Could not read orders: {exc}")
+        await _reply_plain(message, f"❌ Не удалось получить ордера: {exc}")
         await state.clear()
         return
 
     if side is not None:
         await message.answer(
-            f"Auto-detected side: <b>{side}</b> from your open orders.",
+            f"Сторона определена автоматически: <b>{side}</b> (по вашим открытым ордерам).",
             parse_mode=ParseMode.HTML,
         )
         await _run_track_discovery(message, state, engine, symbol=symbol, side=side)
@@ -736,7 +738,7 @@ async def track_symbol(
 
     # Ambiguous — fall back to manual side selection.
     await message.answer(
-        f"Couldn't auto-detect side: {detect_err}\n\nPick manually:",
+        f"Не удалось определить сторону автоматически: {detect_err}\n\nВыберите вручную:",
         reply_markup=side_keyboard(),
     )
     await state.set_state(TrackBlockFSM.SIDE)
@@ -764,13 +766,13 @@ async def _run_track_discovery(
     side: BlockSide,
 ) -> None:
     """Shared discovery + preview logic used by both auto and manual paths."""
-    await message.answer("🔍 Reading your open orders from Binance…")
+    await message.answer("🔍 Читаю ваши открытые ордера на Binance…")
 
     try:
         result = await engine.discover_tracked_orders(symbol=symbol, side=side)
     except Exception as exc:  # noqa: BLE001
         logger.exception("discover_tracked_orders failed")
-        await _reply_plain(message, f"❌ Could not read orders: {exc}")
+        await _reply_plain(message, f"❌ Не удалось получить ордера: {exc}")
         await state.clear()
         return
 
@@ -802,7 +804,7 @@ async def _run_track_discovery(
         parse_mode=ParseMode.HTML,
     )
     await state.set_state(TrackBlockFSM.CANCEL_PRICE)
-    await message.answer("Step 2/2 — cancel price?")
+    await message.answer("Шаг 2/2 — цена отмены (price-invalid)?")
 
 
 @router.message(TrackBlockFSM.CANCEL_PRICE, F.text)
@@ -810,7 +812,7 @@ async def track_cancel_price(message: Message, state: FSMContext) -> None:
     try:
         cancel_price = float((message.text or "").strip())
     except ValueError:
-        await message.answer("Send a single number.")
+        await message.answer("Отправьте одно число.")
         return
 
     data = await state.get_data()
@@ -822,24 +824,24 @@ async def track_cancel_price(message: Message, state: FSMContext) -> None:
     entries = [r["entry_price"] for r in rungs]
     if side == BlockSide.BUY and cancel_price <= max(entries):
         await message.answer(
-            f"❌ For BUY blocks the cancel price must be above the highest "
-            f"entry ({max(entries)})."
+            f"❌ Для BUY блока цена отмены должна быть выше самого высокого "
+            f"входа ({max(entries)})."
         )
         return
     if side == BlockSide.SELL and cancel_price >= min(entries):
         await message.answer(
-            f"❌ For SELL blocks the cancel price must be below the lowest "
-            f"entry ({min(entries)})."
+            f"❌ Для SELL блока цена отмены должна быть ниже самого низкого "
+            f"входа ({min(entries)})."
         )
         return
 
     await state.update_data(cancel_price=cancel_price)
     await state.set_state(TrackBlockFSM.CONFIRM)
     await message.answer(
-        f"📋 <b>Confirm tracking</b>\n"
-        f"Symbol: <code>{symbol}</code> <b>{side}</b>\n"
-        f"Rungs: <b>{len(rungs)}</b>\n"
-        f"Cancel price: <code>{cancel_price}</code>",
+        f"📋 <b>Подтвердите отслеживание</b>\n"
+        f"Символ: <code>{symbol}</code> <b>{side}</b>\n"
+        f"Ордеров: <b>{len(rungs)}</b>\n"
+        f"Цена отмены: <code>{cancel_price}</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=confirm_keyboard(),
     )
@@ -848,7 +850,7 @@ async def track_cancel_price(message: Message, state: FSMContext) -> None:
 @router.callback_query(TrackBlockFSM.CONFIRM, F.data == CB_CANCEL)
 async def track_cancel(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await query.message.answer("Tracking cancelled.")
+    await query.message.answer("Отслеживание отменено.")
     await query.answer()
 
 
@@ -866,7 +868,7 @@ async def track_confirm(
     rungs = [TrackedRung(**rd) for rd in data["rungs"]]
 
     await query.answer()
-    await query.message.answer("Adopting orders…")
+    await query.message.answer("Подхватываю ордера…")
 
     try:
         block = await engine.track_block(
@@ -878,12 +880,12 @@ async def track_confirm(
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("track_block failed")
-        await _reply_plain(query.message, f"❌ Failed: {exc}")
+        await _reply_plain(query.message, f"❌ Ошибка: {exc}")
         await state.clear()
         return
 
     await query.message.answer(
-        f"✅ Block <b>#{block.id}</b> is now tracked. Status: ACTIVE",
+        f"✅ Блок <b>#{block.id}</b> подхвачен. Статус: ACTIVE",
         parse_mode=ParseMode.HTML,
     )
     await state.clear()
@@ -900,7 +902,7 @@ async def cmd_fib(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(FibBlockFSM.SYMBOL)
     await message.answer(
-        "Step 1/6 — send the symbol (e.g. <code>BTCUSDT</code>).",
+        "Шаг 1/6 — отправьте символ (например, <code>BTCUSDT</code>).",
         parse_mode=ParseMode.HTML,
     )
 
@@ -909,12 +911,12 @@ async def cmd_fib(message: Message, state: FSMContext) -> None:
 async def fib_symbol(message: Message, state: FSMContext) -> None:
     symbol = (message.text or "").strip().upper()
     if not symbol.isalnum() or len(symbol) < 4:
-        await message.answer("Invalid symbol. Try again.")
+        await message.answer("Неверный символ. Попробуйте ещё раз.")
         return
     await state.update_data(symbol=symbol)
     await state.set_state(FibBlockFSM.SIDE)
     await message.answer(
-        "Step 2/6 — choose side:",
+        "Шаг 2/6 — выберите сторону:",
         reply_markup=side_keyboard(),
     )
 
@@ -926,10 +928,9 @@ async def fib_side(query: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(FibBlockFSM.ZERO_PRICE)
     if query.message is not None:
         await query.message.answer(
-            "Step 3/6 — send the <b>0%</b> anchor price.\n"
-            "For BUY blocks pick the high (top of the move); the "
-            "ladder will descend from there. For SELL blocks pick "
-            "the low; the ladder will ascend.",
+            "Шаг 3/6 — отправьте якорную цену <b>0%</b>.\n"
+            "Для BUY блоков выберите максимум (вершина движения); "
+            "лестница пойдёт вниз. Для SELL — минимум; лестница пойдёт вверх.",
             parse_mode=ParseMode.HTML,
         )
     await query.answer()
@@ -950,11 +951,11 @@ def _parse_float(text: str | None) -> float | None:
 async def fib_zero_price(message: Message, state: FSMContext) -> None:
     value = _parse_float(message.text)
     if value is None:
-        await message.answer("Send a positive number.")
+        await message.answer("Отправьте положительное число.")
         return
     await state.update_data(zero_price=value)
     await state.set_state(FibBlockFSM.HUNDRED_PRICE)
-    await message.answer("Step 4/6 — send the <b>100%</b> anchor price.",
+    await message.answer("Шаг 4/6 — отправьте якорную цену <b>100%</b>.",
                          parse_mode=ParseMode.HTML)
 
 
@@ -962,14 +963,15 @@ async def fib_zero_price(message: Message, state: FSMContext) -> None:
 async def fib_hundred_price(message: Message, state: FSMContext) -> None:
     value = _parse_float(message.text)
     if value is None:
-        await message.answer("Send a positive number.")
+        await message.answer("Отправьте положительное число.")
         return
     await state.update_data(hundred_price=value)
     await state.set_state(FibBlockFSM.FIRST_RISK)
     await message.answer(
-        "Step 5/6 — send the <b>first rung's risk</b> in USDT "
-        "(e.g. <code>1</code> = $1 max loss if rung 1's SL fires).\n"
-        "Subsequent rungs grow by 1.5× automatically.",
+        "Шаг 5/6 — отправьте <b>риск 1-го ордера</b> в USDT "
+        "(например, <code>1</code> = $1 максимальный убыток если "
+        "сработает SL первого ордера).\nРиски следующих ордеров "
+        "увеличиваются автоматически в 1.5×.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -978,14 +980,14 @@ async def fib_hundred_price(message: Message, state: FSMContext) -> None:
 async def fib_first_risk(message: Message, state: FSMContext) -> None:
     value = _parse_float(message.text)
     if value is None:
-        await message.answer("Send a positive number.")
+        await message.answer("Отправьте положительное число.")
         return
     await state.update_data(first_risk=value)
     await state.set_state(FibBlockFSM.CANCEL_PRICE)
     await message.answer(
-        "Step 6/6 — send the <b>cancel price</b> (price-invalid). If "
-        "the market reaches it before any entry triggers, the whole "
-        "block is cancelled.",
+        "Шаг 6/6 — отправьте <b>цену отмены</b> (price-invalid). Если "
+        "рынок достигнет её до того, как сработает любой вход, весь "
+        "блок будет отменён.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -998,7 +1000,7 @@ async def fib_cancel_price(
 ) -> None:
     cancel_price = _parse_float(message.text)
     if cancel_price is None:
-        await message.answer("Send a positive number.")
+        await message.answer("Отправьте положительное число.")
         return
 
     data = await state.get_data()
@@ -1018,14 +1020,14 @@ async def fib_cancel_price(
             return
         logger.exception("get_leverage failed")
         await _reply_plain(
-            message, f"❌ Could not read leverage for {symbol}: {exc}"
+            message, f"❌ Не удалось получить плечо для {symbol}: {exc}"
         )
         await state.clear()
         return
     except Exception as exc:  # noqa: BLE001
         logger.exception("get_leverage failed")
         await _reply_plain(
-            message, f"❌ Could not read leverage for {symbol}: {exc}"
+            message, f"❌ Не удалось получить плечо для {symbol}: {exc}"
         )
         await state.clear()
         return
@@ -1071,7 +1073,7 @@ async def fib_cancel_price(
 async def fib_cancel(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if query.message is not None:
-        await query.message.answer("Plan cancelled.")
+        await query.message.answer("План отменён.")
     await query.answer()
 
 
@@ -1100,24 +1102,24 @@ async def fib_confirm(
         )
         plan.validate()
     except ValueError as exc:
-        await _reply_plain(query.message, f"❌ Plan rejected: {exc}")
+        await _reply_plain(query.message, f"❌ План отклонён: {exc}")
         await state.clear()
         await query.answer()
         return
 
-    await query.message.answer("Placing 24 orders on Binance…")
+    await query.message.answer("Размещаю ордера на Binance…")
     await query.answer()
 
     try:
         block = await engine.create_block(plan, chat_id=chat_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("create_block failed (fib)")
-        await _reply_plain(query.message, f"❌ Failed: {exc}")
+        await _reply_plain(query.message, f"❌ Ошибка: {exc}")
         await state.clear()
         return
 
     await query.message.answer(
-        f"✅ Block <b>#{block.id}</b> placed and active.",
+        f"✅ Блок <b>#{block.id}</b> создан и активен.",
         parse_mode=ParseMode.HTML,
     )
     await state.clear()

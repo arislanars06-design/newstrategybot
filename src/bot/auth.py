@@ -30,5 +30,5 @@ class AllowListMiddleware(BaseMiddleware):
             return await handler(event, data)
         # Soft-reject silently for messages, ignore other update types.
         if isinstance(event, Message):
-            await event.answer("Access denied.")
+            await event.answer("Доступ запрещён.")
         return None

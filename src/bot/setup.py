@@ -33,8 +33,8 @@ def build_bot(settings: Settings) -> Bot:
 # /stats, /reports, /balance, /raw) still work — they just aren't
 # pushed at the trader on every chat.
 ADVERTISED_COMMANDS: list[BotCommand] = [
-    BotCommand(command="start", description="Open the main menu"),
-    BotCommand(command="menu", description="Main menu"),
+    BotCommand(command="start", description="Открыть главное меню"),
+    BotCommand(command="menu", description="Главное меню"),
 ]
 
 
