@@ -7,6 +7,7 @@ The single Router defined here is registered with the dispatcher in
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aiogram import F, Router
@@ -45,6 +46,7 @@ from src.bot.keyboards import (
     CB_STATS_7D,
     CB_STATS_30D,
     CB_STATS_ALL,
+    CB_STATS_CUSTOM,
     CB_STATS_TODAY,
     block_submenu_keyboard,
     confirm_keyboard,
@@ -52,7 +54,7 @@ from src.bot.keyboards import (
     side_keyboard,
     stats_window_keyboard,
 )
-from src.bot.states import FibBlockFSM, NewBlockFSM, TrackBlockFSM
+from src.bot.states import FibBlockFSM, NewBlockFSM, StatsRangeFSM, TrackBlockFSM
 from src.core.engine import BlockEngine
 from src.core.fib import compute_fib_plan
 from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan
@@ -276,6 +278,95 @@ async def stats_window(query: CallbackQuery) -> None:
     await _send_stats(query.message, days=days)
 
 
+# Custom-range picker (📅 Свой период) — two-step FSM prompt for the
+# start and end dates, both interpreted as Tashkent local (UTC+5).
+# We accept the loose forms YYYY-MM-DD and DD.MM.YYYY since traders
+# in this region commonly type dates in either format.
+_TASHKENT_TZ_HANDLER = timezone(timedelta(hours=5), name="UTC+5")
+_DATE_INPUT_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y")
+
+
+def _parse_local_date(text: str) -> datetime | None:
+    """Parse a YYYY-MM-DD / DD.MM.YYYY date as start-of-day Tashkent."""
+    text = text.strip()
+    for fmt in _DATE_INPUT_FORMATS:
+        try:
+            d = datetime.strptime(text, fmt)
+            return d.replace(tzinfo=_TASHKENT_TZ_HANDLER)
+        except ValueError:
+            continue
+    return None
+
+
+@router.callback_query(F.data == CB_STATS_CUSTOM)
+async def stats_custom_start(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    if query.message is None:
+        return
+    await state.set_state(StatsRangeFSM.SINCE)
+    await query.message.answer(
+        "📅 <b>Свой период</b>\n\n"
+        "Введите <b>начальную</b> дату в формате "
+        "<code>YYYY-MM-DD</code> или <code>DD.MM.YYYY</code>\n"
+        "Например: <code>2026-06-01</code> или <code>01.06.2026</code>\n\n"
+        "Или /cancel — для выхода.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("cancel"), StatsRangeFSM.SINCE)
+@router.message(Command("cancel"), StatsRangeFSM.UNTIL)
+async def stats_custom_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Выбор периода отменён.")
+
+
+@router.message(StatsRangeFSM.SINCE)
+async def stats_custom_since(message: Message, state: FSMContext) -> None:
+    since = _parse_local_date((message.text or "").strip())
+    if since is None:
+        await _reply_plain(
+            message,
+            "Не понял дату. Используйте YYYY-MM-DD или DD.MM.YYYY.\n"
+            "Например: 2026-06-01 или 01.06.2026"
+        )
+        return
+    # Stash as ISO string — FSM storage must be JSON-serialisable.
+    await state.update_data(since_iso=since.isoformat())
+    await state.set_state(StatsRangeFSM.UNTIL)
+    await message.answer(
+        "Введите <b>конечную</b> дату в том же формате "
+        "(включительно — статистика учтёт весь этот день):",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(StatsRangeFSM.UNTIL)
+async def stats_custom_until(message: Message, state: FSMContext) -> None:
+    until_start = _parse_local_date((message.text or "").strip())
+    if until_start is None:
+        await _reply_plain(
+            message,
+            "Не понял дату. Используйте YYYY-MM-DD или DD.MM.YYYY."
+        )
+        return
+
+    data = await state.get_data()
+    since = datetime.fromisoformat(data["since_iso"])
+    # Inclusive end-of-day: 23:59:59.999999 in Tashkent local time.
+    until = until_start.replace(hour=23, minute=59, second=59, microsecond=999_999)
+    if until < since:
+        await _reply_plain(
+            message,
+            f"Конечная дата ({until:%Y-%m-%d}) раньше начальной "
+            f"({since:%Y-%m-%d}). Введите конечную дату ещё раз:"
+        )
+        return
+
+    await state.clear()
+    await _send_stats(message, since=since, until=until)
+
+
 # =============================================================================
 # /list, /block, /cancel, /stats, /balance
 # =============================================================================
@@ -421,9 +512,17 @@ async def cmd_reports(message: Message) -> None:
     await _send_reports(message, days=days)
 
 
-async def _send_stats(message: Message, *, days: int | None) -> None:
+async def _send_stats(
+    message: Message,
+    *,
+    days: int | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> None:
     async with session_scope() as session:
-        stats = await repository.aggregate_stats(session, days=days)
+        stats = await repository.aggregate_stats(
+            session, days=days, since=since, until=until
+        )
     await _reply_html(message, format_stats(stats))
 
 

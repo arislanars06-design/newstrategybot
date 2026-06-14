@@ -323,22 +323,36 @@ async def aggregate_stats(
     session: AsyncSession,
     *,
     days: int | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> dict[str, Any]:
     """Compute aggregate statistics across closed blocks.
 
     Parameters
     ----------
     days:
-        Optional rolling window in days, applied against ``closed_at``.
-        ``None`` means "all time". Pass ``1`` for "today", ``7`` for the
-        last week, etc.
+        Rolling window in days applied against ``closed_at``. ``None``
+        means "all time" (unless ``since``/``until`` are set). Pass
+        ``1`` for "today", ``7`` for the last week, etc.
+    since, until:
+        Explicit absolute window. Both are timezone-aware datetimes
+        and are matched against ``closed_at`` (>= since, <= until).
+        Either or both may be ``None``. When ``since`` or ``until``
+        is provided, ``days`` is ignored — the call site picks one
+        windowing scheme, not both at once.
     """
     stmt = select(Block).where(
         Block.status.in_(
             [BlockStatus.WIN, BlockStatus.LOSS, BlockStatus.INVALID, BlockStatus.ERROR]
         )
     )
-    if days is not None and days > 0:
+
+    if since is not None or until is not None:
+        if since is not None:
+            stmt = stmt.where(Block.closed_at >= since)
+        if until is not None:
+            stmt = stmt.where(Block.closed_at <= until)
+    elif days is not None and days > 0:
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
         stmt = stmt.where(Block.closed_at >= cutoff)
 
@@ -353,6 +367,8 @@ async def aggregate_stats(
     win_rate = (wins / total * 100.0) if total else 0.0
     return {
         "window_days": days,
+        "since": since,
+        "until": until,
         "total_closed": total,
         "wins": wins,
         "losses": losses,

@@ -37,6 +37,7 @@ CB_STATS_3MO = "stats:90"
 CB_STATS_6MO = "stats:180"
 CB_STATS_1Y = "stats:365"
 CB_STATS_ALL = "stats:0"
+CB_STATS_CUSTOM = "stats:custom"
 
 
 def side_keyboard() -> InlineKeyboardMarkup:
@@ -86,7 +87,7 @@ def block_submenu_keyboard() -> InlineKeyboardMarkup:
 
 
 def stats_window_keyboard() -> InlineKeyboardMarkup:
-    """Time-window picker — Сегодня / 7д / 30д / 3мес / 6мес / 1г / Все."""
+    """Time-window picker — Сегодня / 7д / 30д / 3мес / 6мес / 1г / Все / Свой период."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -101,6 +102,9 @@ def stats_window_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="Все", callback_data=CB_STATS_ALL),
+                InlineKeyboardButton(text="📅 Свой период", callback_data=CB_STATS_CUSTOM),
+            ],
+            [
                 InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU_BACK),
             ],
         ]

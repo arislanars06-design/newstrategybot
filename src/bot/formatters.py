@@ -347,7 +347,23 @@ def format_tracker_preview(symbol: str, side: Any, result: Any) -> str:
 # =============================================================================
 
 
-def _stats_window_label(days: int | None) -> str:
+def _stats_window_label(stats: dict[str, Any]) -> str:
+    """Render a human-readable label for the stats window.
+
+    Three regimes:
+      * Custom range  — ``since`` / ``until`` are set; render in
+        Tashkent local time.
+      * Rolling days  — legacy fixed buckets via ``window_days``.
+      * All time      — both fall back here.
+    """
+    since = stats.get("since")
+    until = stats.get("until")
+    if since is not None or until is not None:
+        s = _format_local(since) if since is not None else "—"
+        u = _format_local(until) if until is not None else "—"
+        return f"{s} — {u}"
+
+    days = stats.get("window_days")
     if days is None:
         return "Всё время"
     if days == 1:
@@ -356,7 +372,7 @@ def _stats_window_label(days: int | None) -> str:
 
 
 def format_stats(stats: dict[str, Any]) -> str:
-    label = _stats_window_label(stats.get("window_days"))
+    label = _stats_window_label(stats)
     return (
         f"📊 <b>Статистика</b> — {label}\n"
         f"Закрытых блоков: <b>{stats['total_closed']}</b>\n"
