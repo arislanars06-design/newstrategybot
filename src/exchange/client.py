@@ -81,21 +81,35 @@ _LEVERAGE_TTL_SECONDS = 300.0
 def _extract_order_id(response: Any, client_id: str, *, kind: str) -> str:
     """Pull the exchange ID out of a Binance order placement response.
 
-    Binance USDT-M Futures (``/fapi/v1/order``) returns ``orderId`` for
-    every order type we place — LIMIT, STOP_MARKET, TAKE_PROFIT_MARKET.
-    There is no separate algo/conditional pipeline on this venue: the
-    ``/fapi/v1/algo/...`` endpoints don't exist (HTTP -5000 "Path
-    invalid"). An earlier version of this code accepted ``algoId`` as
-    a fallback, but that branch never fired in production and the
-    matching cancel-via-algo path produced thousands of warning lines
-    in journalctl. We now require ``orderId`` and surface anything
-    else as a RuntimeError so it's diagnosable on the first occurrence.
+    Binance USDT-M Futures uses two response shapes depending on order
+    type, even though both go through ``/fapi/v1/order``:
+
+    * **Regular** orders (LIMIT, MARKET) come back with ``orderId`` and
+      ``clientOrderId`` — our originally supplied ``newClientOrderId``.
+    * **Conditional / algo** orders (STOP_MARKET, TAKE_PROFIT_MARKET)
+      come back with ``algoId`` and ``clientAlgoId`` — Binance rewrites
+      the client id with the broker prefix (``x-Cb7ytek...``). The
+      response also carries ``algoType: CONDITIONAL`` and
+      ``algoStatus: NEW`` so it is unmistakable.
+
+    The returned id is opaque to callers — it gets stored on the
+    ``Order`` row and replayed for cancellation. Cancel layer below
+    handles both shapes.
+
+    On any other response (missing field, unexpected error dict that
+    wasn't raised as an exception) we raise RuntimeError with the full
+    payload so it's diagnosable from journalctl on the first occurrence.
     """
-    if isinstance(response, dict) and "orderId" in response:
-        return str(response["orderId"])
+    if isinstance(response, dict):
+        if "orderId" in response:
+            return str(response["orderId"])
+        if "algoId" in response:
+            # Conditional / algo response. STOP_MARKET / TAKE_PROFIT_MARKET
+            # currently always come back this way on USDT-M Futures.
+            return str(response["algoId"])
     raise RuntimeError(
         f"Binance {kind} placement (client_id={client_id}) returned an "
-        f"unexpected response with no 'orderId': "
+        f"unexpected response with neither 'orderId' nor 'algoId': "
         f"type={type(response).__name__}, value={response!r}"
     )
 
@@ -416,17 +430,29 @@ class BinanceClient:
     async def cancel_order_by_exchange_id(self, symbol: str, order_id: str) -> bool:
         """Cancel an order by its Binance exchange ID.
 
-        Binance USDT-M Futures only has one cancel endpoint
-        (``DELETE /fapi/v1/order``). The ``/fapi/v1/algo/...`` family
-        does not exist on this venue (the gateway returns HTTP -5000
-        "Path invalid"), so there is nothing to fall back to.
+        Binance USDT-M Futures only exposes one per-order cancel
+        endpoint (``DELETE /fapi/v1/order``). It accepts ``orderId``
+        for regular orders. Conditional/algo orders come back from
+        placement with ``algoId`` (see :func:`_extract_order_id`),
+        but ``DELETE /fapi/v1/order`` does **not** accept that id —
+        it returns ``-2011 "Unknown order sent"``. The various
+        ``/fapi/v1/algo/...`` and ``/fapi/v1/conditional/...`` cancel
+        paths don't exist on this venue (gateway returns ``-5000
+        "Path invalid"``), so there's no meaningful per-order cancel
+        for algo orders.
 
-        Returns ``True`` when the cancel succeeds. Returns ``False``
-        when Binance reports the order is already gone (``-2011``
-        "Unknown order sent" or ``-2013`` "Order does not exist") —
-        i.e. the order was filled, expired or already cancelled. This
-        makes the call idempotent and matches the semantics of
-        :meth:`cancel_order_by_client_id`.
+        Strategy: try the regular cancel and treat ``-2011`` /
+        ``-2013`` as "can't reach via this endpoint" — return
+        ``False``. The caller (engine ``_cancel_all_orders``) follows
+        every per-order pass with a ``futures_cancel_all_open_orders``
+        bulk sweep, which **does** wipe conditional orders cleanly.
+        That sweep is the authoritative cleanup; the per-order pass
+        is a courtesy that succeeds for the LIMIT (entry / TP) family
+        and silently no-ops for STOP_MARKET (SL).
+
+        Returns ``True`` if the regular cancel went through; ``False``
+        if the order is either already gone or addressable only via
+        bulk cancel.
         """
         assert self._client is not None
         try:
@@ -435,7 +461,8 @@ class BinanceClient:
         except BinanceAPIException as exc:
             if exc.code in (-2011, -2013):
                 logger.debug(
-                    "cancel_order: orderId={oid} already gone ({code} {msg})",
+                    "cancel_order: orderId={oid} not cancellable as regular "
+                    "({code} {msg}); leaving for bulk cancel-all sweep",
                     oid=order_id, code=exc.code, msg=exc.message,
                 )
                 return False
