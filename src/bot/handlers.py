@@ -33,6 +33,8 @@ from src.bot.keyboards import (
     CB_BLOCK_LIST,
     CB_BLOCK_MODIFY,
     CB_CANCEL,
+    CB_CANCEL_BLOCK_CONFIRM,
+    CB_CANCEL_BLOCK_PICK,
     CB_CONFIRM,
     CB_MENU_BACK,
     CB_MENU_BALANCE,
@@ -49,6 +51,8 @@ from src.bot.keyboards import (
     CB_STATS_CUSTOM,
     CB_STATS_TODAY,
     block_submenu_keyboard,
+    cancel_block_confirm_keyboard,
+    cancel_block_picker_keyboard,
     confirm_keyboard,
     main_menu_keyboard,
     side_keyboard,
@@ -184,6 +188,15 @@ async def block_list_cb(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == CB_BLOCK_CANCEL)
 async def block_cancel_cb(query: CallbackQuery) -> None:
+    """Show interactive picker — one button per active block.
+
+    Replaces the older flow where the bot answered with a ``<pre>``
+    block of ``/cancel <id>`` lines and asked the trader to type the
+    command. The picker keyboard rebuilds the same list as inline
+    buttons; clicking one triggers :func:`cancel_block_pick` which
+    confirms and finally :func:`cancel_block_confirm` calls the
+    engine.
+    """
     await query.answer()
     if query.message is None:
         return
@@ -192,12 +205,93 @@ async def block_cancel_cb(query: CallbackQuery) -> None:
     if not active:
         await query.message.answer("Нет активных блоков для отмены.")
         return
-    lines = ["✋ <b>Отменить блок</b>", "", "Выберите блок и выполните команду:"]
-    lines.append("<pre>")
-    for b in active:
-        lines.append(f"/cancel {b.id}    {b.symbol} {b.side} (статус {b.status})")
-    lines.append("</pre>")
-    await query.message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    await query.message.answer(
+        "✋ <b>Выберите блок для закрытия:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_block_picker_keyboard(list(active)),
+    )
+
+
+@router.callback_query(F.data.startswith(CB_CANCEL_BLOCK_PICK))
+async def cancel_block_pick(
+    query: CallbackQuery, engine: BlockEngine
+) -> None:
+    """Block button clicked — show a Yes/No confirmation with PnL preview.
+
+    Pulls realtime PnL best-effort so the trader sees what they're
+    walking away from before clicking 'Yes'. Realtime PnL fetch
+    failures are logged but don't block the confirmation — the close
+    is the operation that matters.
+    """
+    await query.answer()
+    if query.message is None or query.data is None:
+        return
+    try:
+        block_id = int(query.data[len(CB_CANCEL_BLOCK_PICK):])
+    except ValueError:
+        return
+    async with session_scope() as session:
+        block = await repository.get_block(session, block_id)
+    if block is None or block.is_terminal:
+        await query.message.answer(
+            f"Блок #{block_id} больше не активен.",
+            reply_markup=block_submenu_keyboard(),
+        )
+        return
+
+    # Realtime PnL preview — fail open, never block the cancel flow.
+    pnl_line = ""
+    try:
+        realtime = await engine.compute_block_realtime_pnl(block.id)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "realtime PnL fetch failed for cancel preview block={b}",
+            b=block_id,
+        )
+        realtime = None
+
+    if realtime is not None:
+        total = realtime.get("total")
+        realised = realtime.get("realised")
+        if total is not None:
+            sign = "+" if total >= 0 else ""
+            pnl_line = f"\nТекущий PnL: <b>{sign}{round(total, 4)}</b>"
+        elif realised is not None:
+            sign = "+" if realised >= 0 else ""
+            pnl_line = (
+                f"\nРеализованный PnL: <b>{sign}{round(realised, 4)}</b>"
+            )
+
+    text = (
+        f"Закрыть блок <b>#{block.id}</b> "
+        f"<code>{block.symbol}</code> <b>{block.side}</b>?"
+        f"{pnl_line}\n\n"
+        f"Все ожидающие ордера и SL будут отменены."
+    )
+    await query.message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_block_confirm_keyboard(block.id),
+    )
+
+
+@router.callback_query(F.data.startswith(CB_CANCEL_BLOCK_CONFIRM))
+async def cancel_block_confirm(
+    query: CallbackQuery, engine: BlockEngine
+) -> None:
+    """User confirmed — call the engine to close the block."""
+    await query.answer()
+    if query.message is None or query.data is None:
+        return
+    try:
+        block_id = int(query.data[len(CB_CANCEL_BLOCK_CONFIRM):])
+    except ValueError:
+        return
+    await engine.cancel_block(block_id)
+    await query.message.answer(
+        f"✋ Запрос на закрытие блока #{block_id} отправлен.",
+        reply_markup=block_submenu_keyboard(),
+    )
 
 
 @router.callback_query(F.data == CB_BLOCK_MODIFY)

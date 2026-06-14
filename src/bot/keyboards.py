@@ -3,13 +3,18 @@
 The menu structure mirrors the spec the trader laid out:
 
 * Блок (submenu) → Создать / Активные блоки / Отменить / Изменить / Назад
-* Статистика (submenu) → Сегодня / 7д / 30д / 3мес / 6мес / 1г / Все / Назад
+* Статистика (submenu) → Сегодня / 7д / 30д / 3мес / 6мес / 1г / Все / Свой период / Назад
 * Баланс
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Iterable
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+if TYPE_CHECKING:
+    from src.db import Block
 
 # --- side / confirm callbacks (used by /newblock, /track and /fib FSMs) ---
 CB_SIDE_BUY = "side:buy"
@@ -28,6 +33,12 @@ CB_BLOCK_CREATE = "block:create"
 CB_BLOCK_LIST = "block:list"
 CB_BLOCK_CANCEL = "block:cancel"
 CB_BLOCK_MODIFY = "block:modify"
+
+# --- cancel-block interactive flow callbacks ---
+# Two distinct prefixes so a startswith() filter on PICK never matches
+# CONFIRM and vice versa. Both encode the block id as the suffix.
+CB_CANCEL_BLOCK_PICK = "cb:pick:"        # + <block_id>
+CB_CANCEL_BLOCK_CONFIRM = "cb:confirm:"  # + <block_id>
 
 # --- stats time-range callbacks (days; "0" means all-time) ---
 CB_STATS_TODAY = "stats:1"
@@ -83,6 +94,46 @@ def block_submenu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="✏️ Изменить", callback_data=CB_BLOCK_MODIFY)],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU_BACK)],
         ]
+    )
+
+
+def cancel_block_picker_keyboard(blocks: "Iterable[Block]") -> InlineKeyboardMarkup:
+    """One row per active block + a Back row.
+
+    Each block row's callback_data is ``CB_CANCEL_BLOCK_PICK + str(block_id)``
+    so the handler can split on the prefix and recover the integer id.
+    Back goes to the block submenu (parent), not the main menu, so the
+    trader doesn't have to traverse two levels to reach 'Отменить' again.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for b in blocks:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"#{b.id}  {b.symbol} {b.side}  ({b.status})",
+                callback_data=f"{CB_CANCEL_BLOCK_PICK}{b.id}",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU_BLOCK)
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def cancel_block_confirm_keyboard(block_id: int) -> InlineKeyboardMarkup:
+    """Two-button confirmation: Yes-close or Cancel-back-to-picker.
+
+    'Отмена' fires CB_BLOCK_CANCEL, which re-renders the picker — that
+    way the trader can pick a different block in one click rather than
+    bouncing up to the block submenu.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Да, закрыть",
+                callback_data=f"{CB_CANCEL_BLOCK_CONFIRM}{block_id}",
+            ),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=CB_BLOCK_CANCEL),
+        ]]
     )
 
 
