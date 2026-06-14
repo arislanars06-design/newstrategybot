@@ -36,8 +36,15 @@ class FibBlockFSM(StatesGroup):
     """Bot-driven block creation from Fibonacci levels.
 
     The trader supplies five values; the bot computes everything else
-    (entries, TPs, SLs, per-rung qty) from those plus the leverage it
-    reads from Binance for the symbol+side.
+    (entries, TPs, SLs, per-rung qty) from those plus the leverage
+    the trader sets explicitly.
+
+    The cancel price is **not** asked: it is taken automatically from
+    the 0% anchor price, which by construction sits strictly outside
+    the entry ladder (for BUY blocks the ladder runs downward from
+    the 0% level; for SELL blocks it runs upward). This keeps the FSM
+    at six prompts and removes a degree of freedom the trader said
+    they didn't need.
     """
 
     SYMBOL = State()
@@ -45,7 +52,7 @@ class FibBlockFSM(StatesGroup):
     ZERO_PRICE = State()
     HUNDRED_PRICE = State()
     FIRST_RISK = State()
-    CANCEL_PRICE = State()
+    LEVERAGE = State()
     CONFIRM = State()
 
 
