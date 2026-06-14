@@ -1178,7 +1178,7 @@ async def fib_first_risk(message: Message, state: FSMContext) -> None:
     await state.update_data(first_risk=value)
     await state.set_state(FibBlockFSM.LEVERAGE)
     await message.answer(
-        "Шаг 6/6 — отправьте <b>кредитное плечо</b> (целое число от 1 до 125).\n"
+        "Шаг 6/6 — отправьте <b>кредитное плечо</b> (целое число от 1 до 150).\n"
         "Например: <code>10</code> = 10x. Бот применит это плечо к "
         "символу на Binance и использует его при расчёте размеров позиций.",
         parse_mode=ParseMode.HTML,
@@ -1219,8 +1219,8 @@ async def fib_leverage(
             parse_mode=ParseMode.HTML,
         )
         return
-    if leverage < 1 or leverage > 125:
-        await message.answer("Плечо должно быть от 1 до 125. Попробуйте ещё раз.")
+    if leverage < 1 or leverage > 150:
+        await message.answer("Плечо должно быть от 1 до 150. Попробуйте ещё раз.")
         return
 
     data = await state.get_data()
