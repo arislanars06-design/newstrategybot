@@ -430,64 +430,93 @@ class BinanceClient:
     async def cancel_order_by_exchange_id(self, symbol: str, order_id: str) -> bool:
         """Cancel an order by its Binance exchange ID.
 
-        Binance USDT-M Futures only exposes one per-order cancel
-        endpoint (``DELETE /fapi/v1/order``). It accepts ``orderId``
-        for regular orders. Conditional/algo orders come back from
-        placement with ``algoId`` (see :func:`_extract_order_id`),
-        but ``DELETE /fapi/v1/order`` does **not** accept that id —
-        it returns ``-2011 "Unknown order sent"``. The various
-        ``/fapi/v1/algo/...`` and ``/fapi/v1/conditional/...`` cancel
-        paths don't exist on this venue (gateway returns ``-5000
-        "Path invalid"``), so there's no meaningful per-order cancel
-        for algo orders.
+        Effective 2025-12-09 Binance USDT-M Futures has two cancel
+        endpoints, one per pipeline:
 
-        Strategy: try the regular cancel and treat ``-2011`` /
-        ``-2013`` as "can't reach via this endpoint" — return
-        ``False``. The caller (engine ``_cancel_all_orders``) follows
-        every per-order pass with a ``futures_cancel_all_open_orders``
-        bulk sweep, which **does** wipe conditional orders cleanly.
-        That sweep is the authoritative cleanup; the per-order pass
-        is a courtesy that succeeds for the LIMIT (entry / TP) family
-        and silently no-ops for STOP_MARKET (SL).
+        * Regular orders (LIMIT, MARKET, ...): ``DELETE /fapi/v1/order``
+          with ``orderId``.
+        * Conditional / algo orders (STOP_MARKET, TAKE_PROFIT_MARKET,
+          trailing stops): ``DELETE /fapi/v1/algoOrder`` with
+          ``algoId``.
 
-        Returns ``True`` if the regular cancel went through; ``False``
-        if the order is either already gone or addressable only via
-        bulk cancel.
+        We can't tell from the numeric id alone which pipeline placed
+        it (Binance reuses the same big numeric space), so we try the
+        regular endpoint first and fall back to the algo endpoint
+        when Binance returns ``-2011 "Unknown order sent"`` /
+        ``-2013 "Order does not exist"``. If both report "not found"
+        the order is genuinely gone (filled, expired or already
+        cancelled) and we return ``False``.
+
+        Returns ``True`` on a successful cancel; ``False`` when the
+        order was already gone on both pipelines (idempotent).
         """
         assert self._client is not None
         try:
             await self._client.futures_cancel_order(symbol=symbol, orderId=order_id)
             return True
         except BinanceAPIException as exc:
+            if exc.code not in (-2011, -2013):
+                raise
+            logger.debug(
+                "cancel_order: orderId={oid} not regular ({code}); "
+                "trying algoOrder pipeline",
+                oid=order_id, code=exc.code,
+            )
+
+        return await self._cancel_algo_order_by_id(symbol, order_id)
+
+    async def _cancel_algo_order_by_id(self, symbol: str, algo_id: str) -> bool:
+        """Cancel a Binance Futures conditional/algo order.
+
+        Hits ``DELETE /fapi/v1/algoOrder?symbol=...&algoId=...``.
+        Effective 2025-12-09 this is the only path that closes
+        STOP_MARKET / TAKE_PROFIT_MARKET / trailing-stop orders;
+        the regular ``DELETE /fapi/v1/order`` and the bulk
+        ``DELETE /fapi/v1/allOpenOrders`` both ignore them.
+
+        Returns ``True`` on a successful cancel and ``False`` when
+        the algo order was already gone (``-2011`` / ``-2013``).
+        """
+        assert self._client is not None
+        try:
+            await self._client._request_futures_api(  # type: ignore[attr-defined]
+                "delete",
+                "algoOrder",
+                signed=True,
+                data={"symbol": symbol, "algoId": algo_id},
+            )
+            return True
+        except BinanceAPIException as exc:
             if exc.code in (-2011, -2013):
                 logger.debug(
-                    "cancel_order: orderId={oid} not cancellable as regular "
-                    "({code} {msg}); leaving for bulk cancel-all sweep",
-                    oid=order_id, code=exc.code, msg=exc.message,
+                    "cancel_algo: algoId={aid} already gone ({code} {msg})",
+                    aid=algo_id, code=exc.code, msg=exc.message,
                 )
                 return False
+            logger.warning(
+                "cancel_algo: algoId={aid} failed ({code} {msg})",
+                aid=algo_id, code=exc.code, msg=exc.message,
+            )
             raise
 
     async def cancel_all_for_symbol(self, symbol: str) -> None:
         """Defensive: cancel every open order for a symbol.
 
-        Triggered when a managed block enters a terminal state. Two
-        passes:
+        Triggered when a managed block enters a terminal state.
+        Binance USDT-M Futures has two parallel order surfaces, each
+        with its own bulk cancel and listing endpoint, and neither
+        surface sees the other:
 
-        1. ``futures_cancel_all_open_orders`` — the standard
-           ``DELETE /fapi/v1/allOpenOrders`` sweep. Handles every
-           order type the bot places (LIMIT / STOP_MARKET /
-           TAKE_PROFIT_MARKET) on Binance USDT-M Futures.
-        2. Verify with ``futures_get_open_orders`` and cancel any
-           stragglers one-by-one. In practice nothing survives pass 1,
-           but the verify is cheap insurance.
+        Regular pipeline:
+          * ``DELETE /fapi/v1/allOpenOrders``  — bulk cancel
+          * ``GET    /fapi/v1/openOrders``     — list
+        Algo pipeline (effective 2025-12-09):
+          * ``DELETE /fapi/v1/algoOpenOrders`` — bulk cancel
+          * ``GET    /fapi/v1/openAlgoOrders`` — list
 
-        An earlier version of this method also probed a handful of
-        ``/fapi/v1/algo/...`` and ``/fapi/v1/conditional/...``
-        endpoints. None of them exist on USDT-M Futures (Binance edge
-        returns HTTP -5000 "Path invalid"), so they only added noise
-        to journalctl and ~1.5 seconds of latency per block close.
-        They are removed.
+        Sweep both. Verify both. Mop up stragglers via the per-order
+        cancels which already know how to dispatch between the two
+        pipelines.
 
         The method never raises on a Binance error so the rest of
         the cancel flow always completes — best-effort cleanup is
@@ -495,7 +524,7 @@ class BinanceClient:
         """
         assert self._client is not None
 
-        # Pass 1: standard cancel-all.
+        # Pass 1a: regular cancel-all.
         try:
             await self._client.futures_cancel_all_open_orders(symbol=symbol)
             logger.info(
@@ -503,11 +532,10 @@ class BinanceClient:
                 sym=symbol,
             )
         except BinanceAPIException as exc:
-            # -2011 here means there were no open orders to cancel; not an error.
             if exc.code == -2011:
                 logger.debug(
-                    "cancel_all[{sym}]: nothing to cancel ({msg})",
-                    sym=symbol, msg=exc.message,
+                    "cancel_all[{sym}]: no regular orders to cancel",
+                    sym=symbol,
                 )
             else:
                 logger.warning(
@@ -516,42 +544,108 @@ class BinanceClient:
                     sym=symbol, code=exc.code, msg=exc.message,
                 )
 
-        # Pass 2: verify and mop up anything that survived.
+        # Pass 1b: algo cancel-all (conditional / STOP_MARKET / TP_MARKET / trailing).
         try:
-            remaining = await self._client.futures_get_open_orders(symbol=symbol)
+            await self._client._request_futures_api(  # type: ignore[attr-defined]
+                "delete",
+                "algoOpenOrders",
+                signed=True,
+                data={"symbol": symbol},
+            )
+            logger.info(
+                "cancel_all[{sym}]: DELETE /fapi/v1/algoOpenOrders OK",
+                sym=symbol,
+            )
+        except BinanceAPIException as exc:
+            if exc.code == -2011:
+                logger.debug(
+                    "cancel_all[{sym}]: no algo orders to cancel",
+                    sym=symbol,
+                )
+            else:
+                logger.warning(
+                    "cancel_all[{sym}]: algoOpenOrders cancel failed "
+                    "(code={code}, msg={msg})",
+                    sym=symbol, code=exc.code, msg=exc.message,
+                )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "cancel_all[{sym}]: open-orders verification failed: {err}",
+            # python-binance might not expose _request_futures_api on every
+            # release; fail loud at WARNING but don't kill the cancel flow.
+            logger.warning(
+                "cancel_all[{sym}]: algoOpenOrders cancel raised: {err}",
                 sym=symbol, err=exc,
             )
-            return
 
-        if not remaining:
+        # Pass 2: verify both surfaces, mop up anything that survived.
+        leftover_regular: list[dict[str, Any]] = []
+        leftover_algo: list[dict[str, Any]] = []
+        try:
+            leftover_regular = list(
+                await self._client.futures_get_open_orders(symbol=symbol) or []
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "cancel_all[{sym}]: regular open-orders verify failed: {err}",
+                sym=symbol, err=exc,
+            )
+        try:
+            algo_resp = await self._client._request_futures_api(  # type: ignore[attr-defined]
+                "get",
+                "openAlgoOrders",
+                signed=True,
+                data={"symbol": symbol},
+            )
+            # Binance returns {"orders": [...]} for the openAlgoOrders endpoint.
+            if isinstance(algo_resp, dict):
+                leftover_algo = list(algo_resp.get("orders", []) or [])
+            elif isinstance(algo_resp, list):
+                leftover_algo = list(algo_resp)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "cancel_all[{sym}]: openAlgoOrders verify failed: {err}",
+                sym=symbol, err=exc,
+            )
+
+        if not leftover_regular and not leftover_algo:
             logger.info(
-                "cancel_all[{sym}]: nothing left in futures_get_open_orders",
+                "cancel_all[{sym}]: nothing left on either surface "
+                "(regular + algo)",
                 sym=symbol,
             )
             return
 
         logger.warning(
-            "cancel_all[{sym}]: {n} order(s) survived the sweep — "
-            "cancelling individually", sym=symbol, n=len(remaining),
+            "cancel_all[{sym}]: {nr} regular + {na} algo order(s) survived "
+            "the bulk sweep; cancelling individually",
+            sym=symbol, nr=len(leftover_regular), na=len(leftover_algo),
         )
-        for order in remaining:
+        for order in leftover_regular:
             order_id = order.get("orderId")
             if order_id is None:
-                logger.warning(
-                    "cancel_all[{sym}]: leftover order has no orderId: {o}",
-                    sym=symbol, o=order,
-                )
                 continue
             try:
                 await self.cancel_order_by_exchange_id(symbol, str(order_id))
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "cancel_all[{sym}]: per-order cancel failed for "
-                    "orderId={oid}: {err}",
+                    "cancel_all[{sym}]: per-order regular cancel "
+                    "orderId={oid} failed: {err}",
                     sym=symbol, oid=order_id, err=exc,
+                )
+        for order in leftover_algo:
+            algo_id = order.get("algoId") or order.get("orderId")
+            if algo_id is None:
+                logger.warning(
+                    "cancel_all[{sym}]: leftover algo order has no algoId: {o}",
+                    sym=symbol, o=order,
+                )
+                continue
+            try:
+                await self._cancel_algo_order_by_id(symbol, str(algo_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "cancel_all[{sym}]: per-order algo cancel "
+                    "algoId={aid} failed: {err}",
+                    sym=symbol, aid=algo_id, err=exc,
                 )
 
     # ----- Mark price (one-shot) -----
