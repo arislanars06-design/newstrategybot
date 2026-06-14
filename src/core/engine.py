@@ -1019,21 +1019,19 @@ class BlockEngine:
 
         Two-phase cancel:
 
-        1. Targeted per-order pass tries the proper Binance endpoints
-           for each rung's entry, TP and SL. Works cleanly for regular
-           LIMIT and STOP orders (the bulk of the book).
-        2. Brute-force ``futures_cancel_all_open_orders`` afterwards
-           catches anything the per-order pass couldn't reach — most
-           notably Binance's new conditional/algo orders, whose cancel
-           endpoint we couldn't pin down reliably from the docs and
-           which silently survived step 1 in practice.
+        1. Targeted per-order pass tries Binance's regular cancel
+           endpoint for each rung's entry, TP and SL. ``-2011`` /
+           ``-2013`` (already gone) are treated as success.
+        2. A single ``futures_cancel_all_open_orders`` sweep catches
+           anything the per-order pass couldn't reach — typically
+           orders we never recorded an exchange ID for, or stragglers
+           created during a partial restart.
 
-        The brute-force step is gated on the symbol having no other
-        active blocks: otherwise we'd kill another block's resting
-        orders. For tracked blocks (``is_managed=False``) we skip
-        the brute-force entirely because the trader may have
-        unrelated manual orders on the same symbol that they
-        wouldn't expect us to wipe out.
+        The sweep is gated on the symbol having no other active blocks:
+        otherwise we'd kill another block's resting orders. For tracked
+        blocks (``is_managed=False``) we skip the sweep entirely
+        because the trader may have unrelated manual orders on the same
+        symbol that they wouldn't expect us to wipe out.
         """
         for order in block.orders:
             for kind in ("e", "t", "l"):
@@ -1057,7 +1055,7 @@ class BlockEngine:
         ]
         if other_active:
             logger.info(
-                "Skipping brute-force cancel-all on {sym}: {n} other active "
+                "Skipping cancel-all sweep on {sym}: {n} other active "
                 "block(s) share this symbol; their orders would be hit too",
                 sym=block.symbol, n=len(other_active),
             )
@@ -1066,13 +1064,12 @@ class BlockEngine:
         try:
             await self._client.cancel_all_for_symbol(block.symbol)
             logger.info(
-                "Brute-force cancelled remaining orders on {sym} after "
-                "closing block #{b}",
+                "Cancel-all sweep completed on {sym} after closing block #{b}",
                 sym=block.symbol, b=block.id,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Brute-force cancel for {sym} failed: {err}",
+                "Cancel-all sweep for {sym} failed: {err}",
                 sym=block.symbol, err=exc,
             )
 
@@ -1081,22 +1078,13 @@ class BlockEngine:
     ) -> bool:
         """Cancel a single child order, picking the right identifier.
 
-        We always prefer the exchange ID (orderId or algoId) when it's
-        available because :meth:`BinanceClient.cancel_order_by_exchange_id`
-        is symmetric across regular and conditional/algo orders — it
-        tries the regular cancel endpoint first and falls back through
-        the algo cancel endpoint when Binance reports -2011. The
-        client_id route is a safety net only: it covers the brief
+        We prefer the exchange ID (Binance ``orderId``) when it's
+        available; the client_id route is a safety net for the brief
         window between persisting an order row and Binance returning
-        the exchange ID, plus the rare case where placement somehow
-        succeeded without us recording the exchange ID.
-
-        Note: for managed blocks Binance auto-renames the
-        client_order_id of conditional orders to ``x-Cb7ytek...`` (an
-        internal broker prefix), so a cancel-by-client-id with our
-        original ``blkN-sM-l`` value would never match. That's the
-        bug the trader reported — cancel-by-exchange-id sidesteps it
-        entirely.
+        the exchange ID. Both client methods are idempotent: they
+        return ``False`` (rather than raising) when Binance reports
+        ``-2011`` / ``-2013`` "Unknown order" — i.e. the order was
+        already filled, expired or cancelled.
         """
         if kind == "e":
             client_id = order.entry_client_id
