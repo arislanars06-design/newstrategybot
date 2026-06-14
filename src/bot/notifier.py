@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
@@ -29,8 +31,17 @@ class TelegramNotifier:
     Always sends to the chat that owns the block (so the trader gets
     every event in their personal DM with the bot). When a notification
     channel is configured *and* the event type is in
-    :data:`CHANNEL_EVENT_TYPES`, the same message is mirrored to that
-    channel as a high-signal block-status feed.
+    :data:`CHANNEL_EVENT_TYPES`, the same message is also delivered to
+    that channel as a high-signal block-status feed.
+
+    The chat send and the channel send run **in parallel** via
+    ``asyncio.gather``. Earlier the channel send was awaited only after
+    the personal chat send completed, which meant a slow Telegram round
+    trip on one side delayed the other — the trader noticed this when
+    Telegram was rate-limiting the personal chat and the public channel
+    fell tens of seconds behind. Each ``_send`` swallows its own
+    ``TelegramAPIError`` internally so an unreachable channel can never
+    block delivery to the personal chat (and vice-versa).
 
     Wired into the engine via ``BlockEngine(on_notification=...)``.
     """
@@ -42,15 +53,18 @@ class TelegramNotifier:
     async def __call__(self, notification: Notification) -> None:
         text = render_notification(notification)
 
-        # 1. Personal chat — always.
-        await self._send(notification.chat_id, text, scope="chat")
-
-        # 2. Optional channel mirror.
+        sends: list = [self._send(notification.chat_id, text, scope="chat")]
         if (
             self._channel_id is not None
             and notification.type in CHANNEL_EVENT_TYPES
         ):
-            await self._send(self._channel_id, text, scope="channel")
+            sends.append(self._send(self._channel_id, text, scope="channel"))
+
+        # return_exceptions=True is defence in depth: _send already
+        # catches TelegramAPIError, but if a future contributor adds a
+        # path that raises, gather() must never propagate and bubble
+        # back into the engine's _notify try/except.
+        await asyncio.gather(*sends, return_exceptions=True)
 
     async def _send(self, chat_id: int, text: str, *, scope: str) -> None:
         try:

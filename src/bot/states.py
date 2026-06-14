@@ -47,3 +47,16 @@ class FibBlockFSM(StatesGroup):
     FIRST_RISK = State()
     CANCEL_PRICE = State()
     CONFIRM = State()
+
+
+class StatsRangeFSM(StatesGroup):
+    """Two-step prompt for ``/stats`` custom date range.
+
+    Both inputs are interpreted as Tashkent local dates (YYYY-MM-DD).
+    The handler converts them to UTC for the DB query: SINCE becomes
+    00:00 of that local day, UNTIL becomes 23:59:59 of that local day,
+    so a same-day range covers the whole day.
+    """
+
+    SINCE = State()
+    UNTIL = State()

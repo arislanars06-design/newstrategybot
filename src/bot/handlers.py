@@ -7,6 +7,7 @@ The single Router defined here is registered with the dispatcher in
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aiogram import F, Router
@@ -32,6 +33,8 @@ from src.bot.keyboards import (
     CB_BLOCK_LIST,
     CB_BLOCK_MODIFY,
     CB_CANCEL,
+    CB_CANCEL_BLOCK_CONFIRM,
+    CB_CANCEL_BLOCK_PICK,
     CB_CONFIRM,
     CB_MENU_BACK,
     CB_MENU_BALANCE,
@@ -45,14 +48,17 @@ from src.bot.keyboards import (
     CB_STATS_7D,
     CB_STATS_30D,
     CB_STATS_ALL,
+    CB_STATS_CUSTOM,
     CB_STATS_TODAY,
     block_submenu_keyboard,
+    cancel_block_confirm_keyboard,
+    cancel_block_picker_keyboard,
     confirm_keyboard,
     main_menu_keyboard,
     side_keyboard,
     stats_window_keyboard,
 )
-from src.bot.states import FibBlockFSM, NewBlockFSM, TrackBlockFSM
+from src.bot.states import FibBlockFSM, NewBlockFSM, StatsRangeFSM, TrackBlockFSM
 from src.core.engine import BlockEngine
 from src.core.fib import compute_fib_plan
 from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan
@@ -182,6 +188,15 @@ async def block_list_cb(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == CB_BLOCK_CANCEL)
 async def block_cancel_cb(query: CallbackQuery) -> None:
+    """Show interactive picker — one button per active block.
+
+    Replaces the older flow where the bot answered with a ``<pre>``
+    block of ``/cancel <id>`` lines and asked the trader to type the
+    command. The picker keyboard rebuilds the same list as inline
+    buttons; clicking one triggers :func:`cancel_block_pick` which
+    confirms and finally :func:`cancel_block_confirm` calls the
+    engine.
+    """
     await query.answer()
     if query.message is None:
         return
@@ -190,12 +205,93 @@ async def block_cancel_cb(query: CallbackQuery) -> None:
     if not active:
         await query.message.answer("Нет активных блоков для отмены.")
         return
-    lines = ["✋ <b>Отменить блок</b>", "", "Выберите блок и выполните команду:"]
-    lines.append("<pre>")
-    for b in active:
-        lines.append(f"/cancel {b.id}    {b.symbol} {b.side} (статус {b.status})")
-    lines.append("</pre>")
-    await query.message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    await query.message.answer(
+        "✋ <b>Выберите блок для закрытия:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_block_picker_keyboard(list(active)),
+    )
+
+
+@router.callback_query(F.data.startswith(CB_CANCEL_BLOCK_PICK))
+async def cancel_block_pick(
+    query: CallbackQuery, engine: BlockEngine
+) -> None:
+    """Block button clicked — show a Yes/No confirmation with PnL preview.
+
+    Pulls realtime PnL best-effort so the trader sees what they're
+    walking away from before clicking 'Yes'. Realtime PnL fetch
+    failures are logged but don't block the confirmation — the close
+    is the operation that matters.
+    """
+    await query.answer()
+    if query.message is None or query.data is None:
+        return
+    try:
+        block_id = int(query.data[len(CB_CANCEL_BLOCK_PICK):])
+    except ValueError:
+        return
+    async with session_scope() as session:
+        block = await repository.get_block(session, block_id)
+    if block is None or block.is_terminal:
+        await query.message.answer(
+            f"Блок #{block_id} больше не активен.",
+            reply_markup=block_submenu_keyboard(),
+        )
+        return
+
+    # Realtime PnL preview — fail open, never block the cancel flow.
+    pnl_line = ""
+    try:
+        realtime = await engine.compute_block_realtime_pnl(block.id)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "realtime PnL fetch failed for cancel preview block={b}",
+            b=block_id,
+        )
+        realtime = None
+
+    if realtime is not None:
+        total = realtime.get("total")
+        realised = realtime.get("realised")
+        if total is not None:
+            sign = "+" if total >= 0 else ""
+            pnl_line = f"\nТекущий PnL: <b>{sign}{round(total, 4)}</b>"
+        elif realised is not None:
+            sign = "+" if realised >= 0 else ""
+            pnl_line = (
+                f"\nРеализованный PnL: <b>{sign}{round(realised, 4)}</b>"
+            )
+
+    text = (
+        f"Закрыть блок <b>#{block.id}</b> "
+        f"<code>{block.symbol}</code> <b>{block.side}</b>?"
+        f"{pnl_line}\n\n"
+        f"Все ожидающие ордера и SL будут отменены."
+    )
+    await query.message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_block_confirm_keyboard(block.id),
+    )
+
+
+@router.callback_query(F.data.startswith(CB_CANCEL_BLOCK_CONFIRM))
+async def cancel_block_confirm(
+    query: CallbackQuery, engine: BlockEngine
+) -> None:
+    """User confirmed — call the engine to close the block."""
+    await query.answer()
+    if query.message is None or query.data is None:
+        return
+    try:
+        block_id = int(query.data[len(CB_CANCEL_BLOCK_CONFIRM):])
+    except ValueError:
+        return
+    await engine.cancel_block(block_id)
+    await query.message.answer(
+        f"✋ Запрос на закрытие блока #{block_id} отправлен.",
+        reply_markup=block_submenu_keyboard(),
+    )
 
 
 @router.callback_query(F.data == CB_BLOCK_MODIFY)
@@ -276,6 +372,95 @@ async def stats_window(query: CallbackQuery) -> None:
     await _send_stats(query.message, days=days)
 
 
+# Custom-range picker (📅 Свой период) — two-step FSM prompt for the
+# start and end dates, both interpreted as Tashkent local (UTC+5).
+# We accept the loose forms YYYY-MM-DD and DD.MM.YYYY since traders
+# in this region commonly type dates in either format.
+_TASHKENT_TZ_HANDLER = timezone(timedelta(hours=5), name="UTC+5")
+_DATE_INPUT_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y")
+
+
+def _parse_local_date(text: str) -> datetime | None:
+    """Parse a YYYY-MM-DD / DD.MM.YYYY date as start-of-day Tashkent."""
+    text = text.strip()
+    for fmt in _DATE_INPUT_FORMATS:
+        try:
+            d = datetime.strptime(text, fmt)
+            return d.replace(tzinfo=_TASHKENT_TZ_HANDLER)
+        except ValueError:
+            continue
+    return None
+
+
+@router.callback_query(F.data == CB_STATS_CUSTOM)
+async def stats_custom_start(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    if query.message is None:
+        return
+    await state.set_state(StatsRangeFSM.SINCE)
+    await query.message.answer(
+        "📅 <b>Свой период</b>\n\n"
+        "Введите <b>начальную</b> дату в формате "
+        "<code>YYYY-MM-DD</code> или <code>DD.MM.YYYY</code>\n"
+        "Например: <code>2026-06-01</code> или <code>01.06.2026</code>\n\n"
+        "Или /cancel — для выхода.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("cancel"), StatsRangeFSM.SINCE)
+@router.message(Command("cancel"), StatsRangeFSM.UNTIL)
+async def stats_custom_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Выбор периода отменён.")
+
+
+@router.message(StatsRangeFSM.SINCE)
+async def stats_custom_since(message: Message, state: FSMContext) -> None:
+    since = _parse_local_date((message.text or "").strip())
+    if since is None:
+        await _reply_plain(
+            message,
+            "Не понял дату. Используйте YYYY-MM-DD или DD.MM.YYYY.\n"
+            "Например: 2026-06-01 или 01.06.2026"
+        )
+        return
+    # Stash as ISO string — FSM storage must be JSON-serialisable.
+    await state.update_data(since_iso=since.isoformat())
+    await state.set_state(StatsRangeFSM.UNTIL)
+    await message.answer(
+        "Введите <b>конечную</b> дату в том же формате "
+        "(включительно — статистика учтёт весь этот день):",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(StatsRangeFSM.UNTIL)
+async def stats_custom_until(message: Message, state: FSMContext) -> None:
+    until_start = _parse_local_date((message.text or "").strip())
+    if until_start is None:
+        await _reply_plain(
+            message,
+            "Не понял дату. Используйте YYYY-MM-DD или DD.MM.YYYY."
+        )
+        return
+
+    data = await state.get_data()
+    since = datetime.fromisoformat(data["since_iso"])
+    # Inclusive end-of-day: 23:59:59.999999 in Tashkent local time.
+    until = until_start.replace(hour=23, minute=59, second=59, microsecond=999_999)
+    if until < since:
+        await _reply_plain(
+            message,
+            f"Конечная дата ({until:%Y-%m-%d}) раньше начальной "
+            f"({since:%Y-%m-%d}). Введите конечную дату ещё раз:"
+        )
+        return
+
+    await state.clear()
+    await _send_stats(message, since=since, until=until)
+
+
 # =============================================================================
 # /list, /block, /cancel, /stats, /balance
 # =============================================================================
@@ -288,9 +473,9 @@ async def cmd_list(message: Message) -> None:
     if not active:
         await message.answer("Нет активных блоков.")
         return
-    lines = [f"📋 Активные блоки ({len(active)}):"]
-    lines.extend(format_block_summary(b) for b in active)
-    await _reply_html(message, "\n".join(lines))
+    header = f"📋 <b>Активные блоки ({len(active)}):</b>"
+    body = "\n\n".join(format_block_summary(b) for b in active)
+    await _reply_html(message, f"{header}\n\n{body}")
 
 
 @router.message(Command("block"))
@@ -421,9 +606,17 @@ async def cmd_reports(message: Message) -> None:
     await _send_reports(message, days=days)
 
 
-async def _send_stats(message: Message, *, days: int | None) -> None:
+async def _send_stats(
+    message: Message,
+    *,
+    days: int | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> None:
     async with session_scope() as session:
-        stats = await repository.aggregate_stats(session, days=days)
+        stats = await repository.aggregate_stats(
+            session, days=days, since=since, until=until
+        )
     await _reply_html(message, format_stats(stats))
 
 
