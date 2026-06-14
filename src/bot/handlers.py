@@ -288,9 +288,9 @@ async def cmd_list(message: Message) -> None:
     if not active:
         await message.answer("Нет активных блоков.")
         return
-    lines = [f"📋 Активные блоки ({len(active)}):"]
-    lines.extend(format_block_summary(b) for b in active)
-    await _reply_html(message, "\n".join(lines))
+    header = f"📋 <b>Активные блоки ({len(active)}):</b>"
+    body = "\n\n".join(format_block_summary(b) for b in active)
+    await _reply_html(message, f"{header}\n\n{body}")
 
 
 @router.message(Command("block"))

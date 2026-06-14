@@ -8,10 +8,15 @@ UI strings are in Russian — the trader requested a Russian interface.
 Trading terms (BUY/SELL/LONG/SHORT/TP/SL/WIN/LOSS/INVALID) are kept in
 their established Latin form because that's how every Russian-speaking
 crypto trader writes them on charts and in conversations.
+
+Times are stored in UTC but rendered in the trader's local timezone
+(Asia/Tashkent, UTC+5, no DST) so the chat output matches what they
+see on Binance and on their watch.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from html import escape as _h
 from typing import Any
 
@@ -19,6 +24,50 @@ from src.core.notifications import Notification, NotificationType
 from src.core.risk import order_risk_amount, total_block_risk
 from src.db import Block, Order
 from src.db.enums import BlockSide, BlockStatus, OrderState
+
+
+# ---------- timezone / time helpers ----------
+
+# Asia/Tashkent is UTC+5 year-round (no daylight saving). Hard-coding
+# the offset avoids a runtime dependency on tzdata / pytz / zoneinfo
+# and is correct for the trader's location.
+_TASHKENT_OFFSET = timedelta(hours=5)
+_TASHKENT_TZ = timezone(_TASHKENT_OFFSET, name="UTC+5")
+
+
+def _to_tashkent(dt: datetime) -> datetime:
+    """Convert a (possibly naive UTC) datetime to Tashkent local time."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_TASHKENT_TZ)
+
+
+def _format_local(dt: datetime) -> str:
+    """Render a datetime as ``YYYY-MM-DD HH:MM UTC+5``."""
+    local = _to_tashkent(dt)
+    return f"{local:%Y-%m-%d %H:%M} UTC+5"
+
+
+def _format_relative(dt: datetime, *, now: datetime | None = None) -> str:
+    """Render a humanised delta vs now ("2ч 15м назад", "3д 1ч назад")."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
+    secs = int((now - dt).total_seconds())
+    if secs < 0:
+        return "в будущем"
+    if secs < 60:
+        return "только что"
+    if secs < 3600:
+        return f"{secs // 60} мин назад"
+    if secs < 86_400:
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        return f"{h}ч {m}м назад"
+    d = secs // 86_400
+    h = (secs % 86_400) // 3600
+    return f"{d}д {h}ч назад"
 
 
 # ---------- emoji mappings ----------
@@ -56,19 +105,69 @@ def _signed(amount: float, places: int = 2) -> str:
     return f"{sign}{round(amount, places)}"
 
 
+def _block_trade_counter(block: Block) -> str:
+    """One-line summary of how many rungs are in each state.
+
+    Renders a compact "closed/total (counts)" string the trader sees
+    at the top of the block detail view and on every active-block
+    list entry. Closed = TP, SL, ОТМЕНА, ОШИБКА; the trade is no
+    longer in play. Active = currently holding a position. Waiting =
+    not yet triggered.
+
+    Output examples:
+        "0/8 (8 ЖДЁТ)"
+        "3/8 (1 TP, 1 SL, 1 АКТИВЕН, 5 ЖДЁТ)"
+        "8/8 (1 TP, 7 SL)"
+    """
+    counts: dict[str, int] = {}
+    for o in block.orders:
+        label = _ORDER_STATE_LABEL.get(o.state, str(o.state))
+        counts[label] = counts.get(label, 0) + 1
+    total = len(block.orders)
+    closed_labels = {"TP", "SL", "ОТМЕНА", "ОШИБКА"}
+    closed = sum(v for k, v in counts.items() if k in closed_labels)
+    # Stable display order matches the lifecycle.
+    order_priority = ["TP", "SL", "АКТИВЕН", "ЖДЁТ", "ОТМЕНА", "ОШИБКА"]
+    parts = [f"{k} {counts[k]}" for k in order_priority if counts.get(k)]
+    return f"{closed}/{total} ({', '.join(parts)})" if parts else f"0/{total}"
+
+
+def _block_realised_pnl(block: Block) -> float:
+    """Sum of realised PnL across the block's closed rungs (DB only)."""
+    return round(sum((o.pnl or 0.0) for o in block.orders if o.pnl is not None), 4)
+
+
 # =============================================================================
 # Block / order rendering
 # =============================================================================
 
 
 def format_block_summary(block: Block) -> str:
-    """Single-line summary used in the /list response."""
-    return (
-        f"{_status_emoji(block.status)} #{block.id} "
-        f"{block.symbol} {block.side} "
-        f"{block.status} "
-        f"отмена={block.cancel_price}"
+    """Multi-line summary used in the /list response.
+
+    Shows ID, symbol/side, status, opening time (Tashkent + relative),
+    trade counter, realised PnL, and cancel price. The realised PnL
+    here is computed straight from the eager-loaded ``orders`` rows
+    (sum of closed rungs' ``pnl``) — we deliberately do **not** call
+    the exchange for unrealised PnL on every block in /list, to keep
+    the command snappy and avoid hitting Binance rate limits.
+    """
+    realised = _block_realised_pnl(block)
+    counter = _block_trade_counter(block)
+    head = (
+        f"{_status_emoji(block.status)} <b>#{block.id}</b> "
+        f"<code>{block.symbol}</code> <b>{block.side}</b> "
+        f"<i>{block.status}</i>"
     )
+    time_line = (
+        f"   ⏱ <code>{_format_local(block.created_at)}</code> "
+        f"({_format_relative(block.created_at)})"
+    )
+    counter_line = f"   📊 {counter}"
+    if realised != 0.0:
+        counter_line += f"  💵 <b>{_signed(realised, 4)}</b>"
+    cancel_line = f"   ✋ отмена: <code>{block.cancel_price}</code>"
+    return "\n".join([head, time_line, counter_line, cancel_line])
 
 
 def format_block_detail(
@@ -98,6 +197,9 @@ def format_block_detail(
         f"{_status_emoji(block.status)} <b>БЛОК #{block.id}</b>",
         f"<code>{block.symbol}</code> <b>{block.side}</b>",
         f"Статус: <b>{block.status}</b>",
+        f"⏱ Открыт: <code>{_format_local(block.created_at)}</code> "
+        f"({_format_relative(block.created_at)})",
+        f"📊 Сделки: {_block_trade_counter(block)}",
     ]
 
     if block.note:
@@ -161,9 +263,11 @@ def format_block_detail(
                 )
 
     lines.append("")
-    lines.append(f"Создан: <code>{block.created_at:%Y-%m-%d %H:%M UTC}</code>")
     if block.closed_at is not None:
-        lines.append(f"Закрыт: <code>{block.closed_at:%Y-%m-%d %H:%M UTC}</code>")
+        lines.append(
+            f"Закрыт: <code>{_format_local(block.closed_at)}</code> "
+            f"({_format_relative(block.closed_at)})"
+        )
 
     return "\n".join(lines)
 
