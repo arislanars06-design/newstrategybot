@@ -492,16 +492,124 @@ class BinanceClient:
     async def cancel_all_for_symbol(self, symbol: str) -> None:
         """Defensive: cancel every open order for a symbol.
 
-        Used when a block enters a terminal state to make sure no stray
-        orders remain (e.g. after a partial-failure during placement).
+        Triggered when a managed block enters a terminal state. The
+        implementation does three passes because Binance Futures has
+        more than one "open orders" surface and the right endpoint for
+        the new conditional/algo family isn't documented consistently:
+
+        1. ``futures_cancel_all_open_orders`` — the standard
+           ``DELETE /fapi/v1/allOpenOrders`` sweep. Handles regular
+           LIMIT / STOP / TAKE_PROFIT orders cleanly.
+        2. A best-effort tour of the candidate algo / conditional
+           cancel paths. Each is wrapped in its own try/except and
+           logged at INFO on success and DEBUG on failure so the
+           journalctl trace shows which endpoint actually accepted
+           the symbol on this exchange version.
+        3. A verify pass via ``futures_get_open_orders`` plus a
+           best-effort algo-list query. Anything that survives the
+           sweep is logged at WARNING with the full payload so we
+           can iterate on the cancel logic without another retry
+           from the trader.
+
+        The method never raises on a Binance error so the rest of
+        the cancel flow always completes — best-effort cleanup is
+        the whole point.
         """
         assert self._client is not None
+
+        # Pass 1: standard cancel-all (regular orders).
         try:
             await self._client.futures_cancel_all_open_orders(symbol=symbol)
+            logger.info(
+                "cancel_all[{sym}]: futures_cancel_all_open_orders OK",
+                sym=symbol,
+            )
         except BinanceAPIException as exc:
             logger.warning(
-                "cancel_all_for_symbol({sym}) failed: {err}", sym=symbol, err=exc
+                "cancel_all[{sym}]: futures_cancel_all_open_orders failed "
+                "(code={code}, msg={msg})",
+                sym=symbol, code=exc.code, msg=exc.message,
             )
+
+        # Pass 2: try every plausible algo / conditional cancel-all endpoint.
+        # Binance hasn't documented a single canonical path for the new
+        # conditional family on regular Futures, so we try the ones that
+        # pattern-match other algo endpoints and watch the log for which
+        # one wins.
+        candidate_endpoints = [
+            ("delete", "algo/futures/openOrders"),
+            ("delete", "algo/futures/allOpenOrders"),
+            ("delete", "algo/openOrders"),
+            ("delete", "conditional/openOrders"),
+            ("delete", "conditional/allOpenOrders"),
+            ("delete", "algo/order"),
+        ]
+        for method, path in candidate_endpoints:
+            try:
+                await self._client._request_futures_api(  # type: ignore[attr-defined]
+                    method, path, signed=True, data={"symbol": symbol},
+                )
+                logger.info(
+                    "cancel_all[{sym}]: extra endpoint {ep} accepted",
+                    sym=symbol, ep=path,
+                )
+            except BinanceAPIException as exc:
+                logger.debug(
+                    "cancel_all[{sym}]: endpoint {ep} -> code={code} msg={msg}",
+                    sym=symbol, ep=path, code=exc.code, msg=exc.message,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "cancel_all[{sym}]: endpoint {ep} raised {err}",
+                    sym=symbol, ep=path, err=exc,
+                )
+
+        # Pass 3: verify and surface anything that survived.
+        try:
+            remaining = await self._client.futures_get_open_orders(symbol=symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "cancel_all[{sym}]: open-orders verification failed: {err}",
+                sym=symbol, err=exc,
+            )
+            remaining = []
+        if remaining:
+            logger.warning(
+                "cancel_all[{sym}]: {n} order(s) still open after sweep — "
+                "first leftover: {first}",
+                sym=symbol, n=len(remaining), first=remaining[0],
+            )
+        else:
+            logger.info(
+                "cancel_all[{sym}]: nothing left in futures_get_open_orders",
+                sym=symbol,
+            )
+
+        # Probe likely 'list algo / conditional open orders' endpoints
+        # so the log shows what conditional orders are still parked.
+        for method, path in (
+            ("get", "algo/futures/openOrders"),
+            ("get", "conditional/openOrders"),
+        ):
+            try:
+                resp = await self._client._request_futures_api(  # type: ignore[attr-defined]
+                    method, path, signed=True, data={"symbol": symbol},
+                )
+                if resp:
+                    logger.warning(
+                        "cancel_all[{sym}]: {ep} reports leftover {resp}",
+                        sym=symbol, ep=path, resp=resp,
+                    )
+                else:
+                    logger.debug(
+                        "cancel_all[{sym}]: {ep} -> empty",
+                        sym=symbol, ep=path,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "cancel_all[{sym}]: list-endpoint {ep} raised {err}",
+                    sym=symbol, ep=path, err=exc,
+                )
 
     # ----- Mark price (one-shot) -----
 
