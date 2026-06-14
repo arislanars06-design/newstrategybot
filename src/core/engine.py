@@ -1015,7 +1015,26 @@ class BlockEngine:
     async def _cancel_all_orders(
         self, session: AsyncSession, block: Block
     ) -> None:
-        """Cancel every order owned by this block (defensive close)."""
+        """Cancel every order owned by this block (defensive close).
+
+        Two-phase cancel:
+
+        1. Targeted per-order pass tries the proper Binance endpoints
+           for each rung's entry, TP and SL. Works cleanly for regular
+           LIMIT and STOP orders (the bulk of the book).
+        2. Brute-force ``futures_cancel_all_open_orders`` afterwards
+           catches anything the per-order pass couldn't reach — most
+           notably Binance's new conditional/algo orders, whose cancel
+           endpoint we couldn't pin down reliably from the docs and
+           which silently survived step 1 in practice.
+
+        The brute-force step is gated on the symbol having no other
+        active blocks: otherwise we'd kill another block's resting
+        orders. For tracked blocks (``is_managed=False``) we skip
+        the brute-force entirely because the trader may have
+        unrelated manual orders on the same symbol that they
+        wouldn't expect us to wipe out.
+        """
         for order in block.orders:
             for kind in ("e", "t", "l"):
                 await self._cancel_one_order(block, order, kind)
@@ -1028,6 +1047,34 @@ class BlockEngine:
                     event_type=EventType.ORDER_CANCELLED,
                     payload={"reason": "block_terminal"},
                 )
+
+        if not block.is_managed:
+            return
+
+        other_active = [
+            b for b in await repository.list_active_blocks(session)
+            if b.id != block.id and b.symbol == block.symbol
+        ]
+        if other_active:
+            logger.info(
+                "Skipping brute-force cancel-all on {sym}: {n} other active "
+                "block(s) share this symbol; their orders would be hit too",
+                sym=block.symbol, n=len(other_active),
+            )
+            return
+
+        try:
+            await self._client.cancel_all_for_symbol(block.symbol)
+            logger.info(
+                "Brute-force cancelled remaining orders on {sym} after "
+                "closing block #{b}",
+                sym=block.symbol, b=block.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Brute-force cancel for {sym} failed: {err}",
+                sym=block.symbol, err=exc,
+            )
 
     async def _cancel_one_order(
         self, block: Block, order: Order, kind: str
