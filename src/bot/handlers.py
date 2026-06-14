@@ -1176,60 +1176,96 @@ async def fib_first_risk(message: Message, state: FSMContext) -> None:
         await message.answer("Отправьте положительное число.")
         return
     await state.update_data(first_risk=value)
-    await state.set_state(FibBlockFSM.CANCEL_PRICE)
+    await state.set_state(FibBlockFSM.LEVERAGE)
     await message.answer(
-        "Шаг 6/6 — отправьте <b>цену отмены</b> (price-invalid). Если "
-        "рынок достигнет её до того, как сработает любой вход, весь "
-        "блок будет отменён.",
+        "Шаг 6/6 — отправьте <b>кредитное плечо</b> (целое число от 1 до 125).\n"
+        "Например: <code>10</code> = 10x. Бот применит это плечо к "
+        "символу на Binance и использует его при расчёте размеров позиций.",
         parse_mode=ParseMode.HTML,
     )
 
 
-@router.message(FibBlockFSM.CANCEL_PRICE, F.text)
-async def fib_cancel_price(
+@router.message(FibBlockFSM.LEVERAGE, F.text)
+async def fib_leverage(
     message: Message,
     state: FSMContext,
     client: BinanceClient,
 ) -> None:
-    cancel_price = _parse_float(message.text)
-    if cancel_price is None:
-        await message.answer("Отправьте положительное число.")
+    """Apply user-chosen leverage on Binance, then build the plan.
+
+    Two reasons we set leverage *before* we compute the plan, rather
+    than after the user confirms:
+
+    1. The qty/margin formula in :func:`compute_fib_plan` depends on
+       leverage. If we calculated qty for 20× but Binance only allows
+       10× for this symbol, the trader's effective risk would be
+       half of what the preview shows. Setting leverage upfront
+       and re-prompting on rejection avoids that silent mismatch.
+    2. The trader sees the plan rendered with the leverage Binance
+       has actually accepted, so the preview is the truth.
+
+    On Binance rejection we stay in ``LEVERAGE`` state so the user
+    can simply type a smaller number — no need to restart the FSM.
+
+    The cancel price is set automatically to the 0% anchor; we never
+    ask the trader for it any more (per their request).
+    """
+    text = (message.text or "").strip().lower().rstrip("x").strip()
+    try:
+        leverage = int(text)
+    except ValueError:
+        await message.answer(
+            "Отправьте целое число (например, <code>10</code>).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if leverage < 1 or leverage > 125:
+        await message.answer("Плечо должно быть от 1 до 125. Попробуйте ещё раз.")
         return
 
     data = await state.get_data()
     symbol: str = data["symbol"]
     side = BlockSide(data["side"])
-    pos_side = "LONG" if side == BlockSide.BUY else "SHORT"
 
-    # Pull leverage straight from Binance so the trader doesn't have
-    # to repeat what they already configured on the exchange. Fall
-    # back to 10x silently — get_leverage already does that.
+    # Push leverage to Binance up-front. If the symbol's max is below
+    # what the trader typed, Binance refuses with -4028 and we keep
+    # the FSM on this step so they can try a smaller value.
     try:
-        leverage = await client.get_leverage(symbol, pos_side)
+        await client.set_leverage(symbol, leverage)
+        client.invalidate_leverage_cache(symbol)
     except BinanceAPIException as exc:
         if exc.code in RATE_LIMIT_CODES:
             await _reply_plain(message, _format_rate_limit_error(exc))
             await state.clear()
             return
-        logger.exception("get_leverage failed")
         await _reply_plain(
-            message, f"❌ Не удалось получить плечо для {symbol}: {exc}"
+            message,
+            f"❌ Binance отклонил плечо {leverage}× для {symbol}: "
+            f"{exc.message}\nПопробуйте меньшее значение.",
         )
-        await state.clear()
-        return
+        return  # stay on LEVERAGE — let the trader retry
     except Exception as exc:  # noqa: BLE001
-        logger.exception("get_leverage failed")
+        logger.exception("set_leverage failed")
         await _reply_plain(
-            message, f"❌ Не удалось получить плечо для {symbol}: {exc}"
+            message, f"❌ Не удалось установить плечо: {exc}"
         )
         await state.clear()
         return
+
+    # Cancel price is auto-derived from the 0% anchor. By construction
+    # the entry ladder sits strictly *outside* this anchor (entries
+    # start at Fib level 0.681, never at 0.0), so the BlockPlan
+    # validation rule (BUY: cancel > first entry, SELL: cancel < first
+    # entry) is satisfied by an exact equality of cancel_price and
+    # zero_price.
+    zero_price: float = data["zero_price"]
+    cancel_price = zero_price
 
     try:
         plan, rungs = compute_fib_plan(
             symbol=symbol,
             side=side,
-            zero_price=data["zero_price"],
+            zero_price=zero_price,
             hundred_price=data["hundred_price"],
             first_risk_usd=data["first_risk"],
             leverage=leverage,
@@ -1242,8 +1278,8 @@ async def fib_cancel_price(
         return
 
     await state.update_data(
-        cancel_price=cancel_price,
         leverage=leverage,
+        cancel_price=cancel_price,
     )
     await state.set_state(FibBlockFSM.CONFIRM)
     await message.answer(
@@ -1251,7 +1287,7 @@ async def fib_cancel_price(
             symbol,
             side,
             rungs,
-            zero_price=data["zero_price"],
+            zero_price=zero_price,
             hundred_price=data["hundred_price"],
             cancel_price=cancel_price,
             leverage=leverage,
