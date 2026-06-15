@@ -77,7 +77,7 @@ menu button drives. The trader supplies five values:
 
 Every other number is derived. The bot:
 
-* Computes 8 entry prices at Fibonacci levels **68.1, 70.2, 78.6,
+* Computes 8 entry prices at Fibonacci levels **61.8, 70.2, 78.6,
   89.3, 100, 111.8, 123.6 and 130.9 percent** of the user-supplied
   range.
 * Chains stop-losses so each rung's SL equals the next rung's entry;

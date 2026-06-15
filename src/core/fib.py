@@ -10,7 +10,7 @@ the chart — decides the prices. The trader provides only:
 
 The bot computes everything else:
 
-* 8 entry prices at Fibonacci levels 68.1, 70.2, 78.6, 89.3, 100,
+* 8 entry prices at Fibonacci levels 61.8, 70.2, 78.6, 89.3, 100,
   111.8, 123.6 and 130.9 percent of the user-supplied range.
 * 8 chained stop-losses where each rung's SL equals the next rung's
   entry (so the chain rolls down naturally), and rung 8's SL sits at
@@ -37,10 +37,10 @@ from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan, OrderSpec
 from src.db.enums import BlockSide
 
 # Standard Fibonacci levels used by the strategy. 10 levels.
-# Entries occupy indices 1..8 (68.1 % through 130.9 %).
+# Entries occupy indices 1..8 (61.8 % through 130.9 %).
 # SL of rung N sits at index N+1, so rung 8's SL is at index 9 = 138.2 %.
 FIB_LEVELS: list[float] = [
-    0.0, 0.681, 0.702, 0.786, 0.893, 1.0, 1.118, 1.236, 1.309, 1.382,
+    0.0, 0.618, 0.702, 0.786, 0.893, 1.0, 1.118, 1.236, 1.309, 1.382,
 ]
 
 # Risk:reward ratios per rung, exactly as the trader specified.

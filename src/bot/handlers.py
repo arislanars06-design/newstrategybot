@@ -1254,7 +1254,7 @@ async def fib_leverage(
 
     # Cancel price is auto-derived from the 0% anchor. By construction
     # the entry ladder sits strictly *outside* this anchor (entries
-    # start at Fib level 0.681, never at 0.0), so the BlockPlan
+    # start at Fib level 0.618, never at 0.0), so the BlockPlan
     # validation rule (BUY: cancel > first entry, SELL: cancel < first
     # entry) is satisfied by an exact equality of cancel_price and
     # zero_price.
