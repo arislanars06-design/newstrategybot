@@ -419,7 +419,7 @@ class BlockEngine:
                 )
                 chat_id = block.chat_id
                 symbol = block.symbol
-            await self._mark_stream.remove_symbol(symbol)
+            await self._maybe_unsubscribe_mark_stream(symbol)
             await self._notify(
                 type_=NotificationType.BLOCK_MANUAL_CLOSE,
                 block_id=block_id,
@@ -611,7 +611,7 @@ class BlockEngine:
                     ):
                         continue
                     await self._invalidate_block(session, fresh, mark_price=price)
-                await self._mark_stream.remove_symbol(fresh.symbol)
+                await self._maybe_unsubscribe_mark_stream(fresh.symbol)
                 await self._notify(
                     type_=NotificationType.BLOCK_INVALID,
                     block_id=fresh.id,
@@ -797,9 +797,43 @@ class BlockEngine:
             },
         )
 
+    async def _maybe_unsubscribe_mark_stream(self, symbol: str) -> None:
+        """Drop the mark-stream subscription for ``symbol`` IF safe to do so.
+
+        The cancel-price watcher (``_handle_mark_price``) reads from one
+        per-symbol mark-stream subscription. We must keep that
+        subscription alive as long as **any** active block on this
+        symbol still wants cancel-price detection. Calling
+        ``mark_stream.remove_symbol`` unconditionally — as several call
+        sites used to — silently broke cancel-price for unrelated
+        blocks: trader had block A active on ETHUSDT, then block B
+        on the same symbol was manually cancelled, and the unconditional
+        unsubscribe killed mark-price ticks for block A. The bug was
+        only visible when the trader noticed cancel-price never firing
+        on a block that had been sitting idle for hours — verified in
+        production via an empty journalctl grep for ``MarkPriceStream``
+        despite an active block existing.
+
+        ``cancel_price_active`` filters out blocks where the rule no
+        longer applies (an entry has already triggered) so we don't
+        keep a useless subscription open.
+        """
+        async with session_scope() as session:
+            active = await repository.list_active_blocks(session)
+        still_needed = any(
+            b.symbol == symbol and b.cancel_price_active
+            for b in active
+        )
+        if not still_needed:
+            await self._mark_stream.remove_symbol(symbol)
+
     async def _maybe_finalize(self, session: AsyncSession, block: Block) -> None:
         """Detect terminal state by inspecting all child orders."""
         if block.is_terminal:
+            # Already terminal (set elsewhere — typically _on_tp_filled
+            # for a WIN). Drop the mark-stream subscription if no other
+            # active block on this symbol still needs it.
+            await self._maybe_unsubscribe_mark_stream(block.symbol)
             return
 
         states = [o.state for o in block.orders]
@@ -823,6 +857,7 @@ class BlockEngine:
                 await repository.update_block_status(
                     session, block, BlockStatus.WIN, net_pnl=net_pnl
                 )
+            await self._maybe_unsubscribe_mark_stream(block.symbol)
             return
 
         if any_sl:
@@ -841,6 +876,7 @@ class BlockEngine:
                 chat_id=block.chat_id,
                 payload={"net_pnl": net_pnl},
             )
+            await self._maybe_unsubscribe_mark_stream(block.symbol)
             return
 
         # All cancelled, no TP, no SL — equivalent to invalid.
@@ -851,6 +887,7 @@ class BlockEngine:
             event_type=EventType.BLOCK_INVALID,
             payload={"reason": "all_cancelled"},
         )
+        await self._maybe_unsubscribe_mark_stream(block.symbol)
 
     async def _invalidate_block(
         self, session: AsyncSession, block: Block, *, mark_price: float
