@@ -158,8 +158,26 @@ class MarkPriceStream:
                         msg = await sock.recv()
                         if not isinstance(msg, dict):
                             continue
+                        # python-binance wraps individual-stream messages
+                        # as ``{"stream": "<name>", "data": {...}}`` for
+                        # the futures socket family — verified against
+                        # testnet ETHUSDT mark-price updates which arrive
+                        # with the actual 'p' field nested under 'data'.
+                        # An earlier version of this loop read ``msg.get('p')``
+                        # directly, which always returned None and caused
+                        # the cancel-price watcher to silently never fire.
+                        # Unwrap defensively so the same code path keeps
+                        # working if a future python-binance version
+                        # decides to deliver unwrapped payloads.
+                        payload = (
+                            msg["data"]
+                            if isinstance(msg.get("data"), dict)
+                            else msg
+                        )
                         try:
-                            price = float(msg.get("p") or msg.get("markPrice") or 0)
+                            price = float(
+                                payload.get("p") or payload.get("markPrice") or 0
+                            )
                         except (TypeError, ValueError):
                             continue
                         if price <= 0:
