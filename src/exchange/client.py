@@ -394,19 +394,77 @@ class BinanceClient:
         stop_price: float | Decimal | str,
         client_id: str,
     ) -> str:
-        """Place a STOP_MARKET order that closes the position at the stop price."""
+        """Place a STOP_MARKET conditional order — works on both venues.
+
+        Effective 2025-12-09 Binance USDT-M Futures **mainnet** requires
+        conditional orders (STOP_MARKET, TAKE_PROFIT_MARKET, trailing
+        stops) to go through ``POST /fapi/v1/algoOrder``. The legacy
+        ``POST /fapi/v1/order`` path returns ``-4120 "Order type not
+        supported for this endpoint"`` for these types — confirmed on
+        mainnet by external integrators (nautechsystems/nautilus_trader
+        issue #3287).
+
+        On Binance Futures **testnet** the legacy path still accepts
+        STOP_MARKET (and the response carries an ``algoId`` already, in
+        anticipation of the same migration). To keep one binary that
+        works on both venues without a testnet/mainnet conditional, we
+        try the legacy path first (one round trip on testnet, no
+        fallback) and only on ``-4120`` fall through to the algo
+        endpoint. The legacy path's response is read by
+        :func:`_extract_order_id` which already handles the algoId
+        shape, so testnet behaviour is byte-identical.
+
+        ``triggerPrice`` is the algo endpoint's name for what the
+        legacy endpoint called ``stopPrice``.
+        """
         assert self._client is not None
-        order = await self._client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            positionSide=position_side,
-            type=ORDER_TYPE_STOP_MARKET,
-            quantity=self.normalize_qty(symbol, qty),
-            stopPrice=self.normalize_price(symbol, stop_price),
-            workingType=WORKING_TYPE_MARK,
-            newClientOrderId=client_id,
+        norm_qty = self.normalize_qty(symbol, qty)
+        norm_price = self.normalize_price(symbol, stop_price)
+
+        # Path A — legacy /fapi/v1/order. Testnet path; pre-2025-12-09
+        # mainnet path. Returns either orderId or algoId per Binance's
+        # internal routing decision; either way _extract_order_id copes.
+        try:
+            order = await self._client.futures_create_order(
+                symbol=symbol,
+                side=side,
+                positionSide=position_side,
+                type=ORDER_TYPE_STOP_MARKET,
+                quantity=norm_qty,
+                stopPrice=norm_price,
+                workingType=WORKING_TYPE_MARK,
+                newClientOrderId=client_id,
+            )
+            return _extract_order_id(order, client_id, kind="sl")
+        except BinanceAPIException as exc:
+            if exc.code != -4120:
+                raise
+            logger.debug(
+                "place_sl_stop: legacy /fapi/v1/order rejected -4120 "
+                "(cid={cid}); falling back to /fapi/v1/algoOrder",
+                cid=client_id,
+            )
+
+        # Path B — post-2025-12-09 mainnet endpoint. The response shape
+        # mirrors what testnet's legacy path now returns (algoId +
+        # clientAlgoId + algoType=CONDITIONAL).
+        response = await self._client._request_futures_api(  # type: ignore[attr-defined]
+            "post",
+            "algoOrder",
+            signed=True,
+            data={
+                "symbol": symbol,
+                "side": side,
+                "positionSide": position_side,
+                "algoType": "CONDITIONAL",
+                "orderType": ORDER_TYPE_STOP_MARKET,
+                "quantity": norm_qty,
+                "triggerPrice": norm_price,
+                "workingType": WORKING_TYPE_MARK,
+                "clientAlgoId": client_id,
+            },
         )
-        return _extract_order_id(order, client_id, kind="sl")
+        return _extract_order_id(response, client_id, kind="sl")
 
     # ----- Order cancellation -----
 

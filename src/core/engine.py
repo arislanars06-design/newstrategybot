@@ -1152,10 +1152,51 @@ class BlockEngine:
         return False
 
     async def _mark_block_error(self, block_id: int, reason: str) -> None:
+        """Mark a block as ERROR and clean up any orders we already placed.
+
+        Production-found bug: ``_place_entry_orders`` places entries
+        and SLs rung-by-rung. If a later rung fails (typically on SL
+        placement), the per-rung rollback only cancels *that* rung's
+        entry — earlier rungs that succeeded fully are left **dangling
+        on Binance**. Block goes to ERROR but real money stays parked
+        in the orphan margin reservations.
+
+        This method now cancels every order whose Binance ID we managed
+        to record before the failure, by walking the block's rungs and
+        attempting cancel-by-id for entry, TP, and SL slots. Each call
+        is idempotent — :meth:`_cancel_one_order` returns ``False``
+        rather than raising for already-gone orders, so this is safe
+        to call even when only some rungs were placed.
+
+        We also drop the mark-stream subscription if no other active
+        block on this symbol still needs it (PR #6 helper) — pure
+        bookkeeping, since a block in ERROR state never re-arms its
+        cancel-price rule.
+        """
         async with session_scope() as session:
             block = await repository.get_block(session, block_id)
             if block is None or block.is_terminal:
                 return
+            symbol = block.symbol
+
+            # Best-effort cleanup of any orders we placed before failing.
+            # _cancel_one_order is idempotent against -2011/-2013 so
+            # we don't need to track which slots succeeded vs failed.
+            for order in block.orders:
+                for kind in ("e", "t", "l"):
+                    try:
+                        await self._cancel_one_order(block, order, kind)
+                    except Exception:  # noqa: BLE001
+                        # Cleanup is best-effort. A persistent failure
+                        # gets captured in the BLOCK_ERROR audit event
+                        # via the original `reason` string; we don't
+                        # let it block the status transition.
+                        logger.debug(
+                            "BLOCK_ERROR cleanup: cancel block={b} seq={s} "
+                            "kind={k} failed; continuing",
+                            b=block_id, s=order.seq, k=kind,
+                        )
+
             await repository.update_block_status(session, block, BlockStatus.ERROR)
             await repository.add_event(
                 session,
@@ -1164,6 +1205,11 @@ class BlockEngine:
                 payload={"reason": reason},
             )
             chat_id = block.chat_id
+
+        # Mark stream cleanup — only if no other active block on this
+        # symbol still wants cancel-price detection.
+        await self._maybe_unsubscribe_mark_stream(symbol)
+
         await self._notify(
             type_=NotificationType.BLOCK_ERROR,
             block_id=block_id,
