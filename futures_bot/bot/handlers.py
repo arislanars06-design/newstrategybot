@@ -35,6 +35,7 @@ from futures_bot.bot.keyboards import (
     CB_CANCEL_BLOCK_CONFIRM,
     CB_CANCEL_BLOCK_PICK,
     CB_CONFIRM,
+    CB_FSM_BACK,
     CB_MENU_BACK,
     CB_MENU_BALANCE,
     CB_MENU_BLOCK,
@@ -43,6 +44,7 @@ from futures_bot.bot.keyboards import (
     CB_SIDE_SELL,
     CB_SYMBOL_PICK,
     SYMBOL_TIERS,
+    back_only_keyboard,
     block_submenu_keyboard,
     cancel_block_confirm_keyboard,
     cancel_block_picker_keyboard,
@@ -413,6 +415,23 @@ async def fsm_symbol_picked(query: CallbackQuery, state: FSMContext) -> None:
     await query.answer()
 
 
+@router.callback_query(NewBlockFSM.SYMBOL, F.data == CB_CANCEL)
+async def fsm_symbol_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    """Abort the FSM from the symbol-picker step.
+
+    The picker keyboard puts ❌ Отмена on the bottom row because there
+    is no previous step to go back to. The handler clears state and
+    drops the trader at the main menu.
+    """
+    await state.clear()
+    if query.message is not None:
+        await query.message.answer(
+            "Создание блока отменено.",
+            reply_markup=main_menu_keyboard(),
+        )
+    await query.answer()
+
+
 @router.message(NewBlockFSM.SYMBOL, F.text)
 async def fsm_symbol(message: Message, state: FSMContext) -> None:
     symbol = (message.text or "").strip().upper()
@@ -442,6 +461,7 @@ async def fsm_side(query: CallbackQuery, state: FSMContext) -> None:
             "Шаг 3/5 — отправьте цену <b>0%</b> якоря.\n"
             "Для BUY это <b>верх</b> диапазона; для SELL — <b>низ</b>.",
             parse_mode=ParseMode.HTML,
+            reply_markup=back_only_keyboard(),
         )
     await query.answer()
 
@@ -450,7 +470,10 @@ async def fsm_side(query: CallbackQuery, state: FSMContext) -> None:
 async def fsm_zero_price(message: Message, state: FSMContext) -> None:
     price = _parse_float(message.text)
     if price is None or price <= 0:
-        await message.answer("Отправьте одно положительное число.")
+        await message.answer(
+            "Отправьте одно положительное число.",
+            reply_markup=back_only_keyboard(),
+        )
         return
     await state.update_data(zero_price=price)
     await state.set_state(NewBlockFSM.HUNDRED_PRICE)
@@ -458,6 +481,7 @@ async def fsm_zero_price(message: Message, state: FSMContext) -> None:
         "Шаг 4/5 — отправьте цену <b>100%</b> якоря "
         "(противоположный конец диапазона).",
         parse_mode=ParseMode.HTML,
+        reply_markup=back_only_keyboard(),
     )
 
 
@@ -465,7 +489,10 @@ async def fsm_zero_price(message: Message, state: FSMContext) -> None:
 async def fsm_hundred_price(message: Message, state: FSMContext) -> None:
     price = _parse_float(message.text)
     if price is None or price <= 0:
-        await message.answer("Отправьте одно положительное число.")
+        await message.answer(
+            "Отправьте одно положительное число.",
+            reply_markup=back_only_keyboard(),
+        )
         return
     await state.update_data(hundred_price=price)
     await state.set_state(NewBlockFSM.BASE_RISK)
@@ -475,6 +502,7 @@ async def fsm_hundred_price(message: Message, state: FSMContext) -> None:
         "от этой суммы.\n\n"
         "<i>Цена отмены берётся автоматически из 0% якоря.</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=back_only_keyboard(),
     )
 
 
@@ -493,7 +521,10 @@ async def fsm_base_risk(
     """
     risk = _parse_float(message.text)
     if risk is None or risk <= 0:
-        await message.answer("Отправьте одно положительное число.")
+        await message.answer(
+            "Отправьте одно положительное число.",
+            reply_markup=back_only_keyboard(),
+        )
         return
     await state.update_data(base_risk=risk)
 
@@ -573,6 +604,96 @@ async def fsm_cancel_plan(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if query.message is not None:
         await query.message.answer("План отменён.")
+    await query.answer()
+
+
+# ---------------------------------------------------------------------------
+# Generic "⬅ Назад" dispatch — one handler covers every FSM step.
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == CB_FSM_BACK)
+async def fsm_back(query: CallbackQuery, state: FSMContext) -> None:
+    """Rewind the /newblock FSM by one step.
+
+    Each step's keyboard includes a ⬅ Назад button bound to
+    ``CB_FSM_BACK``. We read the current state, hop back one
+    position, and resend the *previous* step's prompt — without
+    clearing the FSM data, so values the trader already entered
+    survive.
+
+    The very first step (SYMBOL) has no predecessor, so its
+    keyboard uses ``CB_CANCEL`` (red ❌ Отмена) instead.
+    """
+    current = await state.get_state()
+    msg = query.message
+    if msg is None:
+        await query.answer()
+        return
+
+    data = await state.get_data()
+    side_str = data.get("side")
+
+    if current == NewBlockFSM.SIDE.state:
+        # SIDE → SYMBOL: show the picker again.
+        await state.set_state(NewBlockFSM.SYMBOL)
+        await msg.answer(
+            "Шаг 1/5 — выберите символ:\n\n"
+            "🥇 рекомендованные · 🥈 хорошие · 🥉 с оговорками · ⚠️ риск\n\n"
+            "<i>Либо отправьте название текстом, если нужного нет в списке.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=symbol_picker_keyboard(),
+        )
+
+    elif current == NewBlockFSM.ZERO_PRICE.state:
+        # ZERO_PRICE → SIDE: re-show BUY/SELL.
+        await state.set_state(NewBlockFSM.SIDE)
+        await msg.answer(
+            "Шаг 2/5 — выберите сторону:",
+            reply_markup=side_keyboard(),
+        )
+
+    elif current == NewBlockFSM.HUNDRED_PRICE.state:
+        # HUNDRED_PRICE → ZERO_PRICE: re-prompt for the first anchor.
+        await state.set_state(NewBlockFSM.ZERO_PRICE)
+        side_hint = ""
+        if side_str:
+            side_hint = (
+                "\nДля BUY это <b>верх</b> диапазона; для SELL — <b>низ</b>."
+            )
+        await msg.answer(
+            "Шаг 3/5 — отправьте цену <b>0%</b> якоря." + side_hint,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_only_keyboard(),
+        )
+
+    elif current == NewBlockFSM.BASE_RISK.state:
+        # BASE_RISK → HUNDRED_PRICE.
+        await state.set_state(NewBlockFSM.HUNDRED_PRICE)
+        await msg.answer(
+            "Шаг 4/5 — отправьте цену <b>100%</b> якоря "
+            "(противоположный конец диапазона).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_only_keyboard(),
+        )
+
+    elif current == NewBlockFSM.CONFIRM.state:
+        # CONFIRM → BASE_RISK: trader wants to re-enter risk.
+        await state.set_state(NewBlockFSM.BASE_RISK)
+        await msg.answer(
+            "Шаг 5/5 — <b>базовый риск</b> в USD на 1-й ордер.\n"
+            "Введите новое значение, чтобы пересчитать план.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_only_keyboard(),
+        )
+
+    else:
+        # No previous step (or FSM cleared) — drop to main menu.
+        await state.clear()
+        await msg.answer(
+            "Главное меню:",
+            reply_markup=main_menu_keyboard(),
+        )
+
     await query.answer()
 
 

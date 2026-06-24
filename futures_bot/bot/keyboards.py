@@ -21,6 +21,13 @@ CB_SIDE_SELL = "side:sell"
 CB_CONFIRM = "confirm:yes"
 CB_CANCEL = "confirm:no"
 
+# --- generic FSM back-step ---
+# All ``/newblock`` steps include a "⬅ Назад" inline button that
+# returns to the previous prompt without losing already-entered
+# data. The handler reads the current FSM state and dispatches to
+# the right re-prompt.
+CB_FSM_BACK = "fsm:back"
+
 # --- main menu ---
 CB_MENU_BLOCK = "menu:block"
 CB_MENU_STATS = "menu:stats"
@@ -88,23 +95,45 @@ SYMBOL_TIERS: list[tuple[str, str]] = [
 
 
 def side_keyboard() -> InlineKeyboardMarkup:
+    """BUY / SELL picker with a back row.
+
+    The back arrow returns to the symbol-picker step in /newblock;
+    when reused elsewhere it just dismisses the FSM.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="🟢 BUY (лонг)", callback_data=CB_SIDE_BUY),
                 InlineKeyboardButton(text="🔴 SELL (шорт)", callback_data=CB_SIDE_SELL),
-            ]
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_FSM_BACK)],
         ]
     )
 
 
 def confirm_keyboard() -> InlineKeyboardMarkup:
+    """Final plan confirmation: ✅ submit / ⬅ revise / ❌ abort."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Подтвердить", callback_data=CB_CONFIRM),
                 InlineKeyboardButton(text="❌ Отмена", callback_data=CB_CANCEL),
-            ]
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад (изменить риск)", callback_data=CB_FSM_BACK)],
+        ]
+    )
+
+
+def back_only_keyboard() -> InlineKeyboardMarkup:
+    """Single ⬅ Назад button for text-input FSM steps.
+
+    Used on the ``zero_price`` / ``hundred_price`` / ``base_risk``
+    prompts so the trader can rewind one step without typing a value
+    or resorting to /menu.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_FSM_BACK)],
         ]
     )
 
@@ -175,6 +204,10 @@ def symbol_picker_keyboard(*, columns: int = 3) -> InlineKeyboardMarkup:
     fits comfortably on a phone for the 6-character names. The order
     is fixed in :data:`SYMBOL_TIERS` so muscle memory holds across
     sessions.
+
+    Trailing row is a ❌ button that aborts the FSM entirely — useful
+    when the trader changed their mind mid-flow without committing
+    to a symbol yet.
     """
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
@@ -190,4 +223,11 @@ def symbol_picker_keyboard(*, columns: int = 3) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+
+    # Bottom row: abort the FSM. We use CB_CANCEL here (not CB_FSM_BACK)
+    # because step 1 has no previous step to go back to.
+    rows.append([
+        InlineKeyboardButton(text="❌ Отмена", callback_data=CB_CANCEL),
+    ])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
