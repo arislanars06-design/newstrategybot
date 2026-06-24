@@ -45,10 +45,52 @@ def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-# Default symbol catalogue. Mirrors XAUUSD / EURUSD / GBPJPY etc as
-# Exness Raw Spread quotes them. Add to it from tests via
-# ``MockAdapter.add_symbol(...)`` rather than editing this file.
+# Quote-currency dependent tick value per 1 standard lot. Real values
+# come from MT5 in production via ``symbol_info`` — these are reasonable
+# mid-2026 cross-rate approximations so the mock previews look right.
+# Pair-specific overrides go below as needed.
+_TICK_VALUE_BY_QUOTE: dict[str, float] = {
+    "USD": 1.0,     # USD-quoted pairs: $10/pip per lot ⇒ $1/tick (5-digit)
+    "JPY": 0.67,    # USDJPY-rate ≈ 150 ⇒ ¥1000/lot ≈ $6.67/pip ⇒ $0.67/tick
+    "GBP": 1.27,    # GBPUSD-rate ≈ 1.27 ⇒ 1 GBP/tick ≈ $1.27 (only EURGBP)
+    "AUD": 0.65,    # AUDUSD ≈ 0.65
+    "CAD": 0.735,   # USDCAD ≈ 1.36 ⇒ 1 CAD ≈ $0.735
+    "CHF": 1.136,   # USDCHF ≈ 0.88 ⇒ 1 CHF ≈ $1.136
+    "NZD": 0.605,   # NZDUSD ≈ 0.605
+}
+
+
+def _forex(symbol: str, *, digits: int, spread_typical: float) -> SymbolInfo:
+    """Build a forex :class:`SymbolInfo` from terse arguments.
+
+    Saves us from typing the same eight boilerplate fields 27 times
+    for the default catalogue. ``digits`` is 3 for JPY pairs (price
+    quoted in yen) and 5 for everything else. ``spread_typical`` is
+    in *price* units, not pips, matching MT5's convention.
+    """
+    quote = symbol[3:6]
+    tick_size = 10 ** -digits
+    return SymbolInfo(
+        symbol=symbol,
+        digits=digits,
+        point=tick_size,
+        trade_tick_size=tick_size,
+        trade_tick_value=_TICK_VALUE_BY_QUOTE.get(quote, 1.0),
+        trade_contract_size=100_000.0,
+        volume_min=0.01,
+        volume_max=100.0,
+        volume_step=0.01,
+        trade_stops_level=0,
+        spread_typical=spread_typical,
+    )
+
+
+# Default symbol catalogue — every pair on the trader's watch list
+# plus gold. Real MT5 fills these from ``symbol_info`` automatically;
+# the mock keeps a static snapshot so the bot can preview plans
+# without a broker connection.
 _DEFAULT_SYMBOLS: dict[str, SymbolInfo] = {
+    # ---- Metal ----
     "XAUUSD": SymbolInfo(
         symbol="XAUUSD",
         digits=2,
@@ -62,58 +104,94 @@ _DEFAULT_SYMBOLS: dict[str, SymbolInfo] = {
         trade_stops_level=0,
         spread_typical=0.20,
     ),
-    "EURUSD": SymbolInfo(
-        symbol="EURUSD",
-        digits=5,
-        point=0.00001,
-        trade_tick_size=0.00001,
-        trade_tick_value=0.1,           # $0.1 P&L per point on 1.00 lot
-        trade_contract_size=100000.0,
-        volume_min=0.01,
-        volume_max=100.0,
-        volume_step=0.01,
-        trade_stops_level=0,
-        spread_typical=0.00008,         # 0.8 pip
-    ),
-    "GBPUSD": SymbolInfo(
-        symbol="GBPUSD",
-        digits=5,
-        point=0.00001,
-        trade_tick_size=0.00001,
-        trade_tick_value=0.1,
-        trade_contract_size=100000.0,
-        volume_min=0.01,
-        volume_max=100.0,
-        volume_step=0.01,
-        trade_stops_level=0,
-        spread_typical=0.0001,          # 1.0 pip
-    ),
+
+    # ---- USD majors (5-digit) ----
+    "EURUSD": _forex("EURUSD", digits=5, spread_typical=0.00008),
+    "GBPUSD": _forex("GBPUSD", digits=5, spread_typical=0.00010),
+    "AUDUSD": _forex("AUDUSD", digits=5, spread_typical=0.00010),
+    "NZDUSD": _forex("NZDUSD", digits=5, spread_typical=0.00013),
+    "USDCAD": _forex("USDCAD", digits=5, spread_typical=0.00012),
+    "USDCHF": _forex("USDCHF", digits=5, spread_typical=0.00012),
+
+    # ---- JPY pairs (3-digit) ----
+    "USDJPY": _forex("USDJPY", digits=3, spread_typical=0.009),
+    "EURJPY": _forex("EURJPY", digits=3, spread_typical=0.012),
+    "GBPJPY": _forex("GBPJPY", digits=3, spread_typical=0.017),
+    "AUDJPY": _forex("AUDJPY", digits=3, spread_typical=0.015),
+    "NZDJPY": _forex("NZDJPY", digits=3, spread_typical=0.020),
+    "CADJPY": _forex("CADJPY", digits=3, spread_typical=0.017),
+    "CHFJPY": _forex("CHFJPY", digits=3, spread_typical=0.019),
+
+    # ---- EUR crosses ----
+    "EURGBP": _forex("EURGBP", digits=5, spread_typical=0.00011),
+    "EURCHF": _forex("EURCHF", digits=5, spread_typical=0.00017),
+    "EURAUD": _forex("EURAUD", digits=5, spread_typical=0.00022),
+    "EURCAD": _forex("EURCAD", digits=5, spread_typical=0.00020),
+    "EURNZD": _forex("EURNZD", digits=5, spread_typical=0.00027),
+
+    # ---- GBP crosses ----
+    "GBPAUD": _forex("GBPAUD", digits=5, spread_typical=0.00025),
+    "GBPCAD": _forex("GBPCAD", digits=5, spread_typical=0.00022),
+    "GBPCHF": _forex("GBPCHF", digits=5, spread_typical=0.00027),
+    "GBPNZD": _forex("GBPNZD", digits=5, spread_typical=0.00037),
+
+    # ---- AUD crosses ----
+    "AUDCAD": _forex("AUDCAD", digits=5, spread_typical=0.00017),
+    "AUDCHF": _forex("AUDCHF", digits=5, spread_typical=0.00019),
+    "AUDNZD": _forex("AUDNZD", digits=5, spread_typical=0.00022),
+
+    # ---- NZD crosses ----
+    "NZDCAD": _forex("NZDCAD", digits=5, spread_typical=0.00022),
+    "NZDCHF": _forex("NZDCHF", digits=5, spread_typical=0.00027),
+
+    # ---- CAD/CHF cross ----
+    "CADCHF": _forex("CADCHF", digits=5, spread_typical=0.00022),
 }
 
 
 # Plausible mid prices used to seed an initial tick on first
 # ``get_tick`` for symbols the trader hasn't fed manually. Anchors
-# the mock close to real Exness quotes so the Telegram preview
+# the mock close to mid-2026 Exness quotes so the Telegram preview
 # numbers look familiar without burdening the trader with extra
 # setup steps. Bid/ask are mid ± half the symbol's typical spread.
 _DEFAULT_MID_PRICES: dict[str, float] = {
+    # Metal
     "XAUUSD": 2640.40,
+    # USD majors
     "EURUSD": 1.08510,
     "GBPUSD": 1.27000,
-    # The following symbols don't have a SymbolInfo above, so they
-    # would still fail on get_symbol_info(); the mid prices are here
-    # for when more symbols are added to _DEFAULT_SYMBOLS later.
-    "USDJPY": 150.25,
-    "GBPJPY": 190.50,
-    "EURJPY": 162.45,
-    "AUDJPY": 100.30,
     "AUDUSD": 0.65500,
     "NZDUSD": 0.60500,
     "USDCAD": 1.36000,
     "USDCHF": 0.88000,
+    # JPY pairs
+    "USDJPY": 150.25,
+    "EURJPY": 162.45,
+    "GBPJPY": 190.50,
+    "AUDJPY": 100.30,
+    "NZDJPY": 91.50,
+    "CADJPY": 110.50,
+    "CHFJPY": 170.50,
+    # EUR crosses
+    "EURGBP": 0.85400,
+    "EURCHF": 0.95500,
+    "EURAUD": 1.65500,
+    "EURCAD": 1.47500,
+    "EURNZD": 1.79500,
+    # GBP crosses
     "GBPAUD": 1.93500,
     "GBPCAD": 1.72500,
-    "EURGBP": 0.85400,
+    "GBPCHF": 1.11800,
+    "GBPNZD": 2.10000,
+    # AUD crosses
+    "AUDCAD": 0.89000,
+    "AUDCHF": 0.57500,
+    "AUDNZD": 1.08500,
+    # NZD crosses
+    "NZDCAD": 0.82000,
+    "NZDCHF": 0.53000,
+    # CAD/CHF
+    "CADCHF": 0.64500,
 }
 
 
