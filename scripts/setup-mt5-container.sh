@@ -98,12 +98,15 @@ docker exec -u abc "${CONTAINER_NAME}" \
         die "Linux-side mt5linux install failed (see log above)"
     }
 # Runtime deps that mt5linux actually needs at import / serve time.
-# Versions left unpinned so pip picks the latest wheel that matches
-# the container's Python; the rigid pins in mt5linux 0.1.9's setup.py
-# don't reflect real compatibility.
+# rpyc is pinned to the exact version mt5linux 0.1.9 was tested
+# against — leaving it unpinned grabs rpyc 6.x whose protocol added
+# message types that the client side (running the same code) still
+# rejects with `ValueError: invalid message type: 18`. plumbum and
+# numpy are left unpinned because mt5linux's pins (1.7.0 / 1.21.4)
+# don't build on Python 3.11.
 docker exec -u abc "${CONTAINER_NAME}" \
-    pip install --user --no-cache-dir --break-system-packages \
-    rpyc plumbum numpy >> /tmp/mt5linux-linux.log 2>&1 || {
+    pip install --user --no-cache-dir --break-system-packages --force-reinstall \
+    "rpyc==5.0.1" plumbum numpy >> /tmp/mt5linux-linux.log 2>&1 || {
         cat /tmp/mt5linux-linux.log
         die "Linux-side mt5linux runtime deps install failed (see log above)"
     }

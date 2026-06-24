@@ -69,9 +69,17 @@ ensure_host_mt5linux() {
         svc_python="/usr/bin/python3"
     fi
 
+    # Check that mt5linux imports AND that rpyc is the protocol-
+    # matching 5.0.1 — anything else handshakes the server and gets
+    # 'ValueError: invalid message type: 18' on first call.
     if "${svc_python}" -c 'import mt5linux' >/dev/null 2>&1; then
-        ok "host already has mt5linux available (${svc_python})"
-        return 0
+        local rpyc_ver
+        rpyc_ver=$("${svc_python}" -c 'import rpyc; print(rpyc.__version__)' 2>/dev/null || echo "?")
+        if [[ "${rpyc_ver}" == "5.0.1" ]]; then
+            ok "host already has mt5linux + rpyc 5.0.1 (${svc_python})"
+            return 0
+        fi
+        warn "  rpyc on host is ${rpyc_ver}, need 5.0.1 — reinstalling"
     fi
 
     say "  - installing mt5linux 0.1.9 for ${svc_python}..."
@@ -81,8 +89,12 @@ ensure_host_mt5linux() {
             cat /tmp/mt5linux-host.log
             die "host-side mt5linux install failed (see log above)"
         }
+    # Pin rpyc to 5.0.1 to match the container's server side.
+    # mt5linux 0.1.9 declares this exact version; the protocol
+    # differs between rpyc 5.x and 6.x so any drift between client
+    # and server produces 'invalid message type: 18' at handshake.
     "${svc_python}" -m pip install --break-system-packages --no-cache-dir \
-        rpyc plumbum numpy >> /tmp/mt5linux-host.log 2>&1 || {
+        --force-reinstall "rpyc==5.0.1" plumbum numpy >> /tmp/mt5linux-host.log 2>&1 || {
             cat /tmp/mt5linux-host.log
             die "host-side mt5linux runtime deps install failed (see log above)"
         }
