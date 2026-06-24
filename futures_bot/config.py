@@ -56,6 +56,22 @@ class Settings(BaseSettings):
     telegram_notify_chat_id: int = Field(...)
     telegram_notify_channel_id: int | None = None
 
+    @field_validator("telegram_notify_channel_id", mode="before")
+    @classmethod
+    def _empty_channel_id_is_none(cls, value: object) -> object:
+        """Treat ``FB_TELEGRAM_NOTIFY_CHANNEL_ID=`` (empty) as None.
+
+        Pydantic's ``int | None`` rejects the empty string before it
+        considers the ``None`` branch, so a trader who left the
+        channel-ID line in their .env but didn't fill it in would
+        otherwise get a confusing "Input should be a valid integer"
+        error on startup. Empty string here is the user-facing way
+        to say "no channel"; we normalise it before validation runs.
+        """
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
     # --- Database ---
     # Separate SQLite file so the crypto DB is never touched.
     database_url: str = "sqlite+aiosqlite:///./data/futures_bot.db"
