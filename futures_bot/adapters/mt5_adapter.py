@@ -6,23 +6,27 @@ the ``mt5linux`` package (https://github.com/lucas-campagna/mt5linux):
 we import ``MetaTrader5`` from there and call its API as if we were
 on Windows.
 
-Because the actual ``mt5linux`` library is only installed inside the
-Wine container's Python environment (and only relevant when MT5 is
-present), this module imports it lazily inside :meth:`connect`. The
-file is otherwise importable in CI / on the developer's laptop, where
-the mock adapter is used.
+Two architectural decisions worth flagging up front:
 
-This implementation is a **skeleton**: the public method bodies raise
-``NotImplementedError`` for now and call ``_todo`` so the engine can
-be wired up against the interface today. The actual MT5 calls are
-filled in once the demo account exists and we can verify the response
-shapes. Every method already includes the docstring and the type
-contract so the rest of the team can code against it.
+* **Blocking RPC.** Every ``mt5linux`` call is a synchronous TCP
+  round-trip. We wrap them in :func:`asyncio.to_thread` so the bot's
+  event loop never stalls, and serialise them behind an asyncio lock
+  because the mt5linux server itself is single-threaded.
+* **DTO translation at the boundary.** mt5linux returns ``rpyc``
+  netref proxies. We copy the scalar fields out into local Python
+  values immediately, so the rest of the bot never sees a network
+  proxy and tests can stub the adapter without touching rpyc.
+
+The actual ``mt5linux`` library is only installed in the Docker
+container's Python environment; CI and dev laptops use the mock
+adapter. Importing this module is therefore safe everywhere — the
+network library is only imported lazily inside :meth:`connect`.
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
@@ -36,14 +40,56 @@ from futures_bot.adapters.base import (
     Tick,
 )
 from futures_bot.config import Settings
+from futures_bot.db.enums import BlockSide
 
 
-def _todo(method: str) -> None:
-    """Raise a uniform message so it's obvious which method still needs work."""
-    raise NotImplementedError(
-        f"MT5Adapter.{method} is not implemented yet — fill in once we have "
-        f"a connected demo account to validate the response shape."
-    )
+# ---------------------------------------------------------------------
+# MT5 constants
+# ---------------------------------------------------------------------
+#
+# Hardcoded so the adapter can be imported (and unit-tested) without
+# the ``mt5linux`` / ``MetaTrader5`` library being installed. Values
+# come from MetaQuotes' official Python integration docs and have not
+# changed since the MT5 build that introduced them. See
+# https://www.mql5.com/en/docs/python_metatrader5 for the full table.
+
+# trade actions
+_TRADE_ACTION_DEAL = 1       # immediate market deal
+_TRADE_ACTION_PENDING = 5    # place a pending order
+_TRADE_ACTION_SLTP = 6       # modify SL/TP of an open position
+_TRADE_ACTION_MODIFY = 7     # modify a still-pending order
+_TRADE_ACTION_REMOVE = 8     # cancel a still-pending order
+
+# order types
+_ORDER_TYPE_BUY = 0
+_ORDER_TYPE_SELL = 1
+_ORDER_TYPE_BUY_LIMIT = 2
+_ORDER_TYPE_SELL_LIMIT = 3
+
+# order time / filling
+_ORDER_TIME_GTC = 0
+_ORDER_FILLING_FOK = 0
+_ORDER_FILLING_IOC = 1
+_ORDER_FILLING_RETURN = 2
+
+# symbol filling-mode bitmask
+_SYMBOL_FILLING_FOK = 1
+_SYMBOL_FILLING_IOC = 2
+
+# retcodes — successful outcomes
+_TRADE_RETCODE_PLACED = 10008       # pending order accepted
+_TRADE_RETCODE_DONE = 10009         # generic success
+_TRADE_RETCODE_DONE_PARTIAL = 10010 # partial fill
+_SUCCESS_RETCODES = frozenset(
+    {_TRADE_RETCODE_PLACED, _TRADE_RETCODE_DONE, _TRADE_RETCODE_DONE_PARTIAL}
+)
+
+# MT5 caps the order comment at 31 characters; truncate defensively.
+_COMMENT_MAX_LEN = 31
+
+# Max slippage (in points) we tolerate for market orders. Only used
+# for close_position; the strategy itself never sends market entries.
+_MARKET_DEVIATION_POINTS = 20
 
 
 class MT5Adapter(BrokerAdapter):
@@ -51,9 +97,9 @@ class MT5Adapter(BrokerAdapter):
 
     Construction is cheap and does not touch the network. Call
     :meth:`connect` to actually open the RPC session. The adapter
-    keeps the imported MT5 module on ``self._mt5`` so concurrent
-    callers share one bridge; an asyncio lock serialises requests
-    because the mt5linux server is single-threaded.
+    caches :class:`SymbolInfo` for the lifetime of the connection
+    because metadata almost never changes intraday but is hit on
+    every fill check.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -61,6 +107,10 @@ class MT5Adapter(BrokerAdapter):
         self._mt5: Any | None = None        # populated in connect()
         self._lock = asyncio.Lock()
         self._connected: bool = False
+        # Symbol-info cache: filled on first request, invalidated on
+        # disconnect so a reconnect after a broker session reset
+        # picks up any changed metadata.
+        self._symbol_cache: dict[str, SymbolInfo] = {}
 
     # ---- Lifecycle ----
 
@@ -73,56 +123,68 @@ class MT5Adapter(BrokerAdapter):
         async with self._lock:
             if self._connected:
                 return
-
-            try:
-                # ``mt5linux`` exposes a near-identical surface to the
-                # Windows ``MetaTrader5`` package. The connection to
-                # the Wine container is opened here.
-                from mt5linux import MetaTrader5  # type: ignore[import-not-found]
-            except ImportError as exc:  # pragma: no cover — env-dependent
-                raise RuntimeError(
-                    "mt5linux is not installed in this environment. "
-                    "Run inside the Docker container or install with "
-                    "`pip install mt5linux`."
-                ) from exc
-
-            self._mt5 = MetaTrader5(
-                host=self._settings.mt5_host,
-                port=self._settings.mt5_port,
-            )
-            if not self._mt5.initialize():
-                error = self._mt5.last_error()
-                raise RuntimeError(f"MT5 initialize() failed: {error}")
-
-            ok = self._mt5.login(
-                login=self._settings.mt5_login,
-                password=self._settings.mt5_password,
-                server=self._settings.mt5_server,
-            )
-            if not ok:
-                error = self._mt5.last_error()
-                self._mt5.shutdown()
-                self._mt5 = None
-                raise RuntimeError(f"MT5 login() failed: {error}")
-
+            await asyncio.to_thread(self._sync_connect)
             self._connected = True
-            account = self._mt5.account_info()
-            logger.success(
-                "MT5 connected: login={login} balance={bal} server={server}",
-                login=getattr(account, "login", "?"),
-                bal=getattr(account, "balance", "?"),
-                server=getattr(account, "server", "?"),
-            )
+
+    def _sync_connect(self) -> None:
+        try:
+            # ``mt5linux`` exposes a near-identical surface to the
+            # Windows ``MetaTrader5`` package. The connection to
+            # the Wine container is opened here.
+            from mt5linux import MetaTrader5  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover — env-dependent
+            raise RuntimeError(
+                "mt5linux is not installed in this environment. "
+                "Run inside the Docker container or install with "
+                "`pip install mt5linux`."
+            ) from exc
+
+        client = MetaTrader5(
+            host=self._settings.mt5_host,
+            port=self._settings.mt5_port,
+        )
+        # initialize() with no args because the terminal is launched
+        # by the Wine container; we just need the RPC channel.
+        if not client.initialize():
+            error = client.last_error()
+            raise RuntimeError(f"MT5 initialize() failed: {error}")
+
+        ok = client.login(
+            login=int(self._settings.mt5_login),
+            password=self._settings.mt5_password,
+            server=self._settings.mt5_server,
+        )
+        if not ok:
+            error = client.last_error()
+            try:
+                client.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(f"MT5 login() failed: {error}")
+
+        self._mt5 = client
+        account = client.account_info()
+        logger.success(
+            "MT5 connected: login={login} balance={bal} server={server}",
+            login=getattr(account, "login", "?"),
+            bal=getattr(account, "balance", "?"),
+            server=getattr(account, "server", "?"),
+        )
 
     async def disconnect(self) -> None:
         async with self._lock:
             if self._mt5 is not None:
+                client = self._mt5
+                # Drop the reference *before* awaiting the blocking
+                # shutdown so a concurrent caller can't try to reuse
+                # a half-closed client.
+                self._mt5 = None
                 try:
-                    self._mt5.shutdown()
+                    await asyncio.to_thread(client.shutdown)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("MT5 shutdown raised: {err}", err=exc)
-            self._mt5 = None
             self._connected = False
+            self._symbol_cache.clear()
 
     async def is_connected(self) -> bool:
         return self._connected and self._mt5 is not None
@@ -130,44 +192,191 @@ class MT5Adapter(BrokerAdapter):
     # ---- Market data ----
 
     async def get_symbol_info(self, symbol: str) -> SymbolInfo:
-        # The MT5 ``symbol_info`` struct exposes everything we need;
-        # we just need to copy the relevant fields into our DTO and
-        # call ``symbol_select(symbol, True)`` first to make sure the
-        # symbol is added to Market Watch (otherwise tick_value is 0).
-        _todo("get_symbol_info")
-        raise AssertionError("unreachable")
+        # Cache hit fast-path — no lock, no RPC. Reads are atomic in
+        # Python so a concurrent miss is harmless: at worst we fetch
+        # the same info twice.
+        cached = self._symbol_cache.get(symbol)
+        if cached is not None:
+            return cached
+
+        async with self._lock:
+            cached = self._symbol_cache.get(symbol)
+            if cached is not None:
+                return cached
+            info = await asyncio.to_thread(self._sync_get_symbol_info, symbol)
+            self._symbol_cache[symbol] = info
+            return info
+
+    def _sync_get_symbol_info(self, symbol: str) -> SymbolInfo:
+        client = self._require_client()
+        # ``symbol_select`` is required at least once per symbol per
+        # MT5 session — otherwise tick_value is 0 and the symbol is
+        # invisible to ``symbol_info_tick``.
+        client.symbol_select(symbol, True)
+        info = client.symbol_info(symbol)
+        if info is None:
+            raise ValueError(
+                f"unknown symbol on broker: {symbol!r} ({client.last_error()})"
+            )
+        # MT5 reports spread as an integer count of points; convert to
+        # price units so the rest of the bot can work in absolute
+        # spread values without re-querying ``point``.
+        point = float(info.point)
+        return SymbolInfo(
+            symbol=str(info.name),
+            digits=int(info.digits),
+            point=point,
+            trade_tick_size=float(info.trade_tick_size),
+            trade_tick_value=float(info.trade_tick_value),
+            trade_contract_size=float(info.trade_contract_size),
+            volume_min=float(info.volume_min),
+            volume_max=float(info.volume_max),
+            volume_step=float(info.volume_step),
+            trade_stops_level=int(info.trade_stops_level),
+            spread_typical=float(info.spread) * point,
+        )
 
     async def get_tick(self, symbol: str) -> Tick:
-        # ``symbol_info_tick`` returns a struct with bid/ask/time;
-        # convert to our Tick dataclass.
-        _todo("get_tick")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_get_tick, symbol)
+
+    def _sync_get_tick(self, symbol: str) -> Tick:
+        client = self._require_client()
+        # Make sure the symbol is on Market Watch; this is idempotent.
+        client.symbol_select(symbol, True)
+        t = client.symbol_info_tick(symbol)
+        if t is None:
+            raise ValueError(
+                f"symbol_info_tick({symbol!r}) returned None: {client.last_error()}"
+            )
+        # ``time`` is a Unix timestamp in seconds; some brokers also
+        # populate ``time_msc`` for millisecond resolution but we
+        # only need second precision for the polling cadence.
+        return Tick(
+            symbol=symbol,
+            bid=float(t.bid),
+            ask=float(t.ask),
+            time=datetime.fromtimestamp(int(t.time), tz=timezone.utc),
+        )
 
     # ---- Account ----
 
     async def get_account_balance(self) -> float:
-        _todo("get_account_balance")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_account_field, "balance")
 
     async def get_account_equity(self) -> float:
-        _todo("get_account_equity")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_account_field, "equity")
 
     async def get_free_margin(self) -> float:
-        _todo("get_free_margin")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_account_field, "margin_free"
+            )
+
+    def _sync_account_field(self, field: str) -> float:
+        client = self._require_client()
+        info = client.account_info()
+        if info is None:
+            raise RuntimeError(f"account_info() returned None: {client.last_error()}")
+        return float(getattr(info, field))
 
     # ---- Orders ----
 
     async def place_order(self, request: OrderRequest) -> OrderResult:
-        # MT5 path: build a TradeRequest dict, call ``order_send``,
-        # interpret the result struct. Limit orders need
-        # ``action=TRADE_ACTION_PENDING``, market orders
-        # ``TRADE_ACTION_DEAL``. The ``type_filling`` must be
-        # ``ORDER_FILLING_RETURN`` so limit orders sit on the book
-        # instead of being cancelled when not immediately fillable.
-        _todo("place_order")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_place_order, request)
+
+    def _sync_place_order(self, request: OrderRequest) -> OrderResult:
+        client = self._require_client()
+        client.symbol_select(request.symbol, True)
+
+        info = client.symbol_info(request.symbol)
+        if info is None:
+            return _fail_result(
+                code=-1,
+                message=f"symbol_info({request.symbol!r}) returned None",
+            )
+        filling_mask = int(getattr(info, "filling_mode", 0) or 0)
+
+        # Build the MT5 request dictionary. Limits and market orders
+        # share most fields but diverge on action, type, price, and
+        # filling mode — see ``_build_*_request``.
+        if request.order_type == "LIMIT":
+            if request.price is None:
+                return _fail_result(
+                    code=-1, message="LIMIT order requires explicit price"
+                )
+            req_dict = self._build_limit_request(request)
+        elif request.order_type == "MARKET":
+            req_dict = self._build_market_request(client, request, filling_mask)
+            if req_dict is None:
+                return _fail_result(
+                    code=-1,
+                    message=f"no tick available for {request.symbol!r}",
+                )
+        else:
+            return _fail_result(
+                code=-1, message=f"unsupported order_type {request.order_type!r}"
+            )
+
+        result = client.order_send(req_dict)
+        return _translate_order_send_result(result)
+
+    def _build_limit_request(self, request: OrderRequest) -> dict[str, Any]:
+        side_is_buy = request.side == BlockSide.BUY
+        order_type = _ORDER_TYPE_BUY_LIMIT if side_is_buy else _ORDER_TYPE_SELL_LIMIT
+        req: dict[str, Any] = {
+            "action": _TRADE_ACTION_PENDING,
+            "symbol": request.symbol,
+            "volume": float(request.lot),
+            "type": order_type,
+            "price": float(request.price),  # type: ignore[arg-type]
+            "magic": int(request.magic),
+            "comment": (request.client_tag or "")[:_COMMENT_MAX_LEN],
+            "type_time": _ORDER_TIME_GTC,
+            # RETURN means "leave the order on the book if it can't
+            # be filled immediately" — exactly what we want for limit
+            # ladder entries. FOK / IOC would cancel the limit on
+            # placement if no taker matched.
+            "type_filling": _ORDER_FILLING_RETURN,
+        }
+        if request.sl is not None:
+            req["sl"] = float(request.sl)
+        if request.tp is not None:
+            req["tp"] = float(request.tp)
+        return req
+
+    def _build_market_request(
+        self,
+        client: Any,
+        request: OrderRequest,
+        filling_mask: int,
+    ) -> dict[str, Any] | None:
+        side_is_buy = request.side == BlockSide.BUY
+        tick = client.symbol_info_tick(request.symbol)
+        if tick is None:
+            return None
+        price = float(tick.ask) if side_is_buy else float(tick.bid)
+        order_type = _ORDER_TYPE_BUY if side_is_buy else _ORDER_TYPE_SELL
+        req: dict[str, Any] = {
+            "action": _TRADE_ACTION_DEAL,
+            "symbol": request.symbol,
+            "volume": float(request.lot),
+            "type": order_type,
+            "price": price,
+            "deviation": _MARKET_DEVIATION_POINTS,
+            "magic": int(request.magic),
+            "comment": (request.client_tag or "")[:_COMMENT_MAX_LEN],
+            "type_time": _ORDER_TIME_GTC,
+            "type_filling": _pick_market_filling(filling_mask),
+        }
+        if request.sl is not None:
+            req["sl"] = float(request.sl)
+        if request.tp is not None:
+            req["tp"] = float(request.tp)
+        return req
 
     async def modify_position(
         self,
@@ -176,38 +385,276 @@ class MT5Adapter(BrokerAdapter):
         sl: float | None,
         tp: float | None,
     ) -> OrderResult:
-        # MT5 path: TRADE_ACTION_SLTP with the position ticket and
-        # new SL/TP. Modifications are atomic — both legs change in
-        # one call, which is exactly what the order-watcher wants
-        # after a fill.
-        _todo("modify_position")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_modify_position, position_ticket, sl, tp
+            )
+
+    def _sync_modify_position(
+        self,
+        position_ticket: str,
+        sl: float | None,
+        tp: float | None,
+    ) -> OrderResult:
+        client = self._require_client()
+        try:
+            ticket_int = int(position_ticket)
+        except (TypeError, ValueError):
+            return _fail_result(code=-1, message=f"bad ticket: {position_ticket!r}")
+
+        positions = client.positions_get(ticket=ticket_int)
+        if not positions:
+            return _fail_result(
+                code=10025,  # MT5 "position not found"
+                message=f"position {position_ticket} not found",
+            )
+        pos = positions[0]
+        req = {
+            "action": _TRADE_ACTION_SLTP,
+            "position": ticket_int,
+            "symbol": str(pos.symbol),
+            # MT5 treats 0.0 as "remove this leg"; pass through None
+            # as 0.0 to support clearing SL or TP intentionally.
+            "sl": float(sl) if sl is not None else 0.0,
+            "tp": float(tp) if tp is not None else 0.0,
+        }
+        result = client.order_send(req)
+        translated = _translate_order_send_result(result)
+        # MT5 SLTP results don't carry a position ticket; re-attach
+        # the one we already know so callers can chain modifications.
+        if translated.ok and translated.position_ticket is None:
+            translated = OrderResult(
+                ok=True,
+                ticket=translated.ticket,
+                position_ticket=position_ticket,
+                filled_price=translated.filled_price,
+                error_code=translated.error_code,
+                error_message=translated.error_message,
+            )
+        return translated
 
     async def cancel_order(self, ticket: str) -> OrderResult:
-        # TRADE_ACTION_REMOVE with the order ticket. Returns the
-        # standard result struct.
-        _todo("cancel_order")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_cancel_order, ticket)
+
+    def _sync_cancel_order(self, ticket: str) -> OrderResult:
+        client = self._require_client()
+        try:
+            ticket_int = int(ticket)
+        except (TypeError, ValueError):
+            return _fail_result(code=-1, message=f"bad ticket: {ticket!r}")
+        req = {
+            "action": _TRADE_ACTION_REMOVE,
+            "order": ticket_int,
+        }
+        result = client.order_send(req)
+        return _translate_order_send_result(result)
 
     async def close_position(self, position_ticket: str) -> OrderResult:
-        # TRADE_ACTION_DEAL with an opposite-side market order, lot
-        # equal to the position size, and the position ticket
-        # referenced in ``position`` field. MT5 nets to zero.
-        _todo("close_position")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_close_position, position_ticket
+            )
+
+    def _sync_close_position(self, position_ticket: str) -> OrderResult:
+        client = self._require_client()
+        try:
+            ticket_int = int(position_ticket)
+        except (TypeError, ValueError):
+            return _fail_result(code=-1, message=f"bad ticket: {position_ticket!r}")
+
+        positions = client.positions_get(ticket=ticket_int)
+        if not positions:
+            return _fail_result(
+                code=10025,
+                message=f"position {position_ticket} not found",
+            )
+        pos = positions[0]
+        symbol = str(pos.symbol)
+        side_is_buy = int(pos.type) == _ORDER_TYPE_BUY
+        tick = client.symbol_info_tick(symbol)
+        if tick is None:
+            return _fail_result(code=-1, message=f"no tick for {symbol!r}")
+        # Closing direction is opposite to the position side.
+        order_type = _ORDER_TYPE_SELL if side_is_buy else _ORDER_TYPE_BUY
+        price = float(tick.bid) if side_is_buy else float(tick.ask)
+
+        info = client.symbol_info(symbol)
+        filling_mask = int(getattr(info, "filling_mode", 0) or 0) if info else 0
+
+        req = {
+            "action": _TRADE_ACTION_DEAL,
+            "position": ticket_int,
+            "symbol": symbol,
+            "volume": float(pos.volume),
+            "type": order_type,
+            "price": price,
+            "deviation": _MARKET_DEVIATION_POINTS,
+            "magic": int(pos.magic),
+            "comment": "fb-close",
+            "type_time": _ORDER_TIME_GTC,
+            "type_filling": _pick_market_filling(filling_mask),
+        }
+        result = client.order_send(req)
+        return _translate_order_send_result(result)
 
     # ---- State sync ----
 
     async def list_open_positions(
         self, symbol: str | None = None
     ) -> list[Position]:
-        # ``positions_get(symbol=…)`` returns a tuple of structs.
-        _todo("list_open_positions")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_list_positions, symbol)
+
+    def _sync_list_positions(self, symbol: str | None) -> list[Position]:
+        client = self._require_client()
+        raw = (
+            client.positions_get(symbol=symbol)
+            if symbol is not None
+            else client.positions_get()
+        )
+        if not raw:
+            return []
+        out: list[Position] = []
+        for p in raw:
+            side = BlockSide.BUY if int(p.type) == _ORDER_TYPE_BUY else BlockSide.SELL
+            sl_raw = float(p.sl)
+            tp_raw = float(p.tp)
+            out.append(
+                Position(
+                    ticket=str(int(p.ticket)),
+                    symbol=str(p.symbol),
+                    side=side,
+                    lot=float(p.volume),
+                    open_price=float(p.price_open),
+                    # MT5 uses 0.0 as "no SL/TP set". Surface that as
+                    # None so the engine doesn't think a position is
+                    # protected when it isn't.
+                    sl=sl_raw if sl_raw > 0 else None,
+                    tp=tp_raw if tp_raw > 0 else None,
+                    profit=float(p.profit),
+                    swap=float(p.swap),
+                    commission=float(getattr(p, "commission", 0.0) or 0.0),
+                    open_time=datetime.fromtimestamp(int(p.time), tz=timezone.utc),
+                    comment=str(p.comment or ""),
+                )
+            )
+        return out
 
     async def list_pending_orders(
         self, symbol: str | None = None
     ) -> list[OrderResult]:
-        # ``orders_get(symbol=…)`` returns the pending limits.
-        _todo("list_pending_orders")
-        raise AssertionError("unreachable")
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_list_pending, symbol)
+
+    def _sync_list_pending(self, symbol: str | None) -> list[OrderResult]:
+        client = self._require_client()
+        raw = (
+            client.orders_get(symbol=symbol)
+            if symbol is not None
+            else client.orders_get()
+        )
+        if not raw:
+            return []
+        out: list[OrderResult] = []
+        for o in raw:
+            out.append(
+                OrderResult(
+                    ok=True,
+                    ticket=str(int(o.ticket)),
+                    position_ticket=None,
+                    # ``price_open`` is what the limit will fill at —
+                    # we surface it as ``filled_price`` so downstream
+                    # consumers don't need a separate field, with the
+                    # caveat that the order hasn't actually filled.
+                    filled_price=float(o.price_open),
+                    error_code=None,
+                    error_message=None,
+                )
+            )
+        return out
+
+    # ---- Internals ----
+
+    def _require_client(self) -> Any:
+        """Return the RPC client or raise if we are not connected."""
+        if self._mt5 is None:
+            raise RuntimeError("MT5Adapter is not connected; call connect() first")
+        return self._mt5
+
+
+# ---------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------
+
+def _pick_market_filling(filling_mask: int) -> int:
+    """Choose a filling mode for a market deal given the symbol's mask.
+
+    Exness symbols typically advertise FOK + IOC. We prefer IOC so a
+    partial fill still produces a position rather than rejecting the
+    deal entirely. If the broker advertises neither flag (a few exotic
+    symbols), fall back to RETURN, which is the universal compatibility
+    choice — better to risk a soft rejection than to send an invalid
+    filling mode.
+    """
+    if filling_mask & _SYMBOL_FILLING_IOC:
+        return _ORDER_FILLING_IOC
+    if filling_mask & _SYMBOL_FILLING_FOK:
+        return _ORDER_FILLING_FOK
+    return _ORDER_FILLING_RETURN
+
+
+def _fail_result(*, code: int, message: str) -> OrderResult:
+    """Construct a failed OrderResult with consistent shape."""
+    return OrderResult(
+        ok=False,
+        ticket=None,
+        position_ticket=None,
+        filled_price=None,
+        error_code=code,
+        error_message=message,
+    )
+
+
+def _translate_order_send_result(result: Any) -> OrderResult:
+    """Convert MT5's ``OrderSendResult`` named tuple into our DTO.
+
+    The struct fields we care about:
+
+    * ``retcode``        — outcome; ``10009``/``10008`` = success.
+    * ``order``          — order ticket allocated by the broker.
+    * ``deal``           — deal ticket for market-order fills; matches
+                           the eventual position ticket on netting
+                           accounts and the new position ticket on
+                           hedging accounts (used by Exness demos).
+    * ``price``          — fill price for immediate deals; 0 for
+                           pending placements.
+    * ``comment``        — error description on failure.
+    """
+    if result is None:
+        return _fail_result(code=-1, message="order_send returned None")
+
+    retcode = int(result.retcode)
+    ok = retcode in _SUCCESS_RETCODES
+    order_ticket = int(getattr(result, "order", 0) or 0)
+    deal_ticket = int(getattr(result, "deal", 0) or 0)
+    price = float(getattr(result, "price", 0.0) or 0.0)
+
+    return OrderResult(
+        ok=ok,
+        ticket=str(order_ticket) if order_ticket else None,
+        # On a market fill, MT5 returns both ``order`` and ``deal``.
+        # The deal ticket is the one that matches the eventual
+        # position on hedging accounts, so prefer it; fall back to
+        # the order ticket if deal is absent (e.g. modifications).
+        position_ticket=(
+            str(deal_ticket)
+            if deal_ticket
+            else (str(order_ticket) if (ok and order_ticket) else None)
+        ),
+        filled_price=price if price > 0 else None,
+        error_code=retcode if not ok else None,
+        error_message=(
+            None if ok else (str(getattr(result, "comment", "")) or f"retcode={retcode}")
+        ),
+    )

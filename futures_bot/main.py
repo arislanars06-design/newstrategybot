@@ -30,6 +30,7 @@ from futures_bot.bot.setup import (
 )
 from futures_bot.config import Settings, get_settings
 from futures_bot.core.engine import BlockEngine
+from futures_bot.core.order_watcher import TickWatcher
 from futures_bot.db.database import close_db, init_db
 from futures_bot.logging_setup import configure_logging
 
@@ -78,6 +79,19 @@ async def _runner() -> None:
         adapter=adapter,
     )
 
+    # The TickWatcher is the second long-running task in the
+    # process. It polls the broker for fresh quotes on every active
+    # symbol and feeds them into ``engine.on_tick``, which is what
+    # actually drives fills, SL/TP exits, and cancel-price detection.
+    # Without this loop the engine would only react to whatever ticks
+    # the test harness or future market-data stream pushes in.
+    watcher = TickWatcher(
+        settings=settings,
+        adapter=adapter,
+        engine=engine,
+    )
+    watcher.start()
+
     # The dispatcher's polling loop is the long-running task. We
     # arrange for a clean shutdown via Unix signal handlers so the
     # process can be stopped with Ctrl-C or a SIGTERM from systemd
@@ -106,6 +120,11 @@ async def _runner() -> None:
         await dispatcher.start_polling(bot)
     finally:
         stopper.cancel()
+        # Stop the watcher BEFORE disconnecting the adapter so its
+        # in-flight RPC call can finish cleanly; otherwise we'd
+        # cancel a coroutine mid-RPC and the broker would log a
+        # spurious disconnect.
+        await watcher.stop()
         await adapter.disconnect()
         await close_db()
         await bot.session.close()
