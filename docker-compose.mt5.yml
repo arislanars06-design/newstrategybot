@@ -5,64 +5,76 @@
 # `futures-bot` service); only the MetaTrader 5 terminal needs Docker,
 # because MT5 is a Windows program and we need Wine to run it on Linux.
 #
+# The gmag11/metatrader5_vnc image is built on top of LinuxServer's
+# KasmVNC base image, which means the "VNC" is actually served as an
+# HTTPS web page on port 3000 — NOT as a traditional VNC protocol on
+# port 5900. You log in with a browser, not with a VNC viewer.
+#
 # Usage on the VPS:
 #
-#   1. Copy / edit `.env` next to this file (set MT5_VNC_PASSWORD at least).
+#   1. Put MT5_VNC_USER and MT5_VNC_PASSWORD into `.env` next to this
+#      file. These are the credentials for the *web* login screen,
+#      not your broker credentials.
 #   2. docker compose -f docker-compose.mt5.yml up -d
-#   3. VNC to 127.0.0.1:5900 (use `ssh -L 5900:127.0.0.1:5900 <vps>`
-#      from your laptop) and log into your Exness demo account once.
-#      The terminal remembers the login afterwards.
-#   4. Confirm the RPC server is reachable from the host:
-#         curl -s 127.0.0.1:8001 || true     # just check the port is open
-#   5. In .env set FB_MT5_HOST=127.0.0.1, FB_MT5_PORT=8001,
-#      FB_MT5_LOGIN / FB_MT5_PASSWORD / FB_MT5_SERVER, FB_USE_MOCK_ADAPTER=0
-#      then `systemctl restart futures-bot`.
+#   3. From your laptop, SSH-tunnel port 3000:
+#         ssh -L 3000:127.0.0.1:3000 root@<vps>
+#      Then open https://localhost:3000 in your browser. Accept the
+#      self-signed certificate warning; log in with the credentials
+#      from step 1.
+#   4. Inside the web session, MetaTrader 5 will already be running.
+#      File → Login to Trade Account; enter your Exness demo login,
+#      password, and server (e.g. Exness-MT5Trial16). Tick "Save
+#      account information" so future container restarts auto-login.
+#   5. ``docker restart futures-mt5`` so the mt5linux RPC service
+#      picks up the newly-running MT5 and starts serving on port 8001.
+#   6. In .env on the host, set FB_MT5_HOST=127.0.0.1, FB_MT5_PORT=8001,
+#      FB_MT5_LOGIN / FB_MT5_PASSWORD / FB_MT5_SERVER, and flip
+#      FB_USE_MOCK_ADAPTER=0; then `systemctl restart futures-bot`.
 #
 # Security notes
 # --------------
 # * Both ports bind to 127.0.0.1 only — never publicly reachable. The
-#   only way to reach VNC from outside is an SSH tunnel.
-# * The VNC password protects the *first-time login session*, not the
-#   actual broker credentials. Pick something non-trivial all the same.
+#   only way to reach the web VNC from outside is an SSH tunnel.
+# * The VNC password protects the *web login screen*, not the actual
+#   broker credentials. Pick something non-trivial all the same.
 # * The named `mt5_data` volume keeps the Wine prefix + MT5 settings
 #   between container restarts so we don't have to re-login every time.
 # =============================================================================
 
 services:
   mt5:
-    # gmag11's image is the most-used Wine + MT5 + mt5linux image on
-    # Docker Hub; it ships with a VNC server and the mt5linux RPC
-    # bridge pre-installed. Pinning to a digest is preferable for prod
-    # but we use :latest during bring-up so updates land naturally.
+    # gmag11's image is built on LinuxServer's KasmVNC baseimage; it
+    # ships with Wine, MT5, Python, and the mt5linux RPC server all
+    # pre-installed. Pinning to a digest is preferable for prod but
+    # we use :latest during bring-up so updates land naturally.
     image: gmag11/metatrader5_vnc:latest
     container_name: futures-mt5
     restart: unless-stopped
 
     environment:
-      # User and password for the VNC session. Override via .env.
+      # Credentials for the KasmVNC web-login screen. Override via
+      # `.env` so they never live in source control.
       CUSTOM_USER: ${MT5_VNC_USER:-trader}
       PASSWORD: ${MT5_VNC_PASSWORD:-change-me-please}
 
     ports:
-      # Loopback-only bindings: the bot connects via 127.0.0.1, and a
-      # VNC client tunnelled through SSH reaches the GUI. Nothing is
-      # ever exposed to the public internet.
-      - "127.0.0.1:5900:5900"   # VNC (one-time Exness login)
+      # Loopback-only bindings: the bot connects to mt5linux via
+      # 127.0.0.1:8001, and a browser tunnelled through SSH reaches
+      # the web VNC on 127.0.0.1:3000. Nothing is ever exposed to
+      # the public internet.
+      - "127.0.0.1:3000:3000"   # KasmVNC web GUI (HTTPS)
       - "127.0.0.1:8001:8001"   # mt5linux RPC server
 
     volumes:
       # Wine prefix + MT5 config + saved-login data. Persists across
-      # `docker compose down`, so you only log in once.
+      # `docker compose down`, so you only log in to the broker once.
       - mt5_data:/config
 
-    # Wine + MT5 spends ~30 s on first boot before the RPC port is
-    # serving requests; give the healthcheck enough grace.
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8001 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 90s
+    # No healthcheck — the image doesn't ship with `nc`/`curl` in the
+    # PATH the healthcheck runs under, and the mt5linux RPC server
+    # legitimately won't be up until *after* the operator has logged
+    # into MT5 inside the web session. A failing healthcheck would
+    # just flap the (unhealthy) flag without anything to act on.
 
 volumes:
   mt5_data:
