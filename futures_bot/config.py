@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     mt5_password: str = Field(..., min_length=1)
     mt5_server: str = Field(..., min_length=1)
 
+    # When true, ``main.py`` builds the in-memory MockAdapter instead
+    # of MT5Adapter, so the bot can run end-to-end without an MT5
+    # container or a real broker account. Toggle via
+    # ``FB_USE_MOCK_ADAPTER=1`` in the .env file or the process env.
+    use_mock_adapter: bool = False
+
     # --- Telegram ---
     # Separate bot + separate channel from the crypto bot so neither
     # the chat history nor the signal channel get mixed.

@@ -14,7 +14,6 @@ everything, await long-running tasks, drain cleanly on signal.
 from __future__ import annotations
 
 import asyncio
-import os
 import signal
 
 from loguru import logger
@@ -37,12 +36,17 @@ from futures_bot.logging_setup import configure_logging
 def _build_adapter(settings: Settings) -> BrokerAdapter:
     """Pick the broker adapter at runtime.
 
-    Setting ``FB_USE_MOCK_ADAPTER=1`` in the environment swaps in the
-    in-memory mock so the bot can run end-to-end without an MT5
-    container. Useful during the bring-up phase before the trader
-    has an Exness demo wired up.
+    Setting ``FB_USE_MOCK_ADAPTER=1`` in the .env file (or the process
+    environment) swaps in the in-memory mock so the bot can run
+    end-to-end without an MT5 container. Useful during the bring-up
+    phase before the trader has an Exness demo wired up.
+
+    The flag lives on ``Settings`` so it picks up values from the
+    .env file the same way every other ``FB_*`` knob does — reading
+    it through ``os.getenv`` would silently miss .env values, which
+    is exactly the bug this commit fixes.
     """
-    if os.getenv("FB_USE_MOCK_ADAPTER", "").strip() in {"1", "true", "yes"}:
+    if settings.use_mock_adapter:
         logger.warning(
             "FB_USE_MOCK_ADAPTER set — running with MockAdapter, no real broker!"
         )
