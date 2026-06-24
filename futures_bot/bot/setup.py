@@ -68,6 +68,10 @@ def build_dispatcher(
 
     dispatcher["engine"] = engine
     dispatcher["adapter"] = adapter
+    # Settings is needed by handlers that read trader-tunable knobs
+    # (like the /newblock instrument picker list). Resolved by name
+    # at call time, same as engine/adapter.
+    dispatcher["settings"] = settings
 
     middleware = AllowListMiddleware(settings.allowed_user_ids)
     dispatcher.message.middleware(middleware)

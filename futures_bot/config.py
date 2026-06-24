@@ -91,6 +91,17 @@ class Settings(BaseSettings):
     # enough not to hammer the RPC.
     tick_poll_interval_ms: int = 500
 
+    # --- Telegram UX ---
+    # Comma-separated list of symbols shown as quick-pick buttons in
+    # ``/newblock``. The trader can always override by tapping
+    # "Другой" and typing the symbol freely — useful for instruments
+    # the broker exposes under a non-standard name (e.g. Exness's
+    # ``XAUUSDm`` mini contracts or ``US500.cash`` indices). Default
+    # covers the majors a discretionary FX/metals trader uses every day.
+    quick_symbols: str = Field(
+        default="XAUUSD,EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,BTCUSD",
+    )
+
     # --- Computed helpers ---
 
     @property
@@ -102,6 +113,16 @@ class Settings(BaseSettings):
             for part in self.telegram_allowed_user_ids.split(",")
             if part.strip()
         }
+
+    @property
+    def quick_symbols_list(self) -> list[str]:
+        """Parse ``quick_symbols`` (comma-separated string) into a list.
+
+        Empty entries and whitespace are dropped. Order is preserved so
+        the trader controls the on-screen layout via .env without code
+        changes.
+        """
+        return [s.strip() for s in self.quick_symbols.split(",") if s.strip()]
 
     @field_validator("log_level")
     @classmethod

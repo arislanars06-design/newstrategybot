@@ -36,6 +36,49 @@ CB_BLOCK_CANCEL = "block:cancel"
 CB_CANCEL_BLOCK_PICK = "cb:pick:"        # + <block_id>
 CB_CANCEL_BLOCK_CONFIRM = "cb:confirm:"  # + <block_id>
 
+# --- /newblock instrument picker ---
+# Symbol callback keeps the symbol literal in the data payload — at
+# 64 bytes total Telegram budget that's safe even for "USDCAD.s" or
+# "US500.cash"-style names. Anything longer than ~50 chars would
+# need a separate id+lookup table; we'd notice via callback failures.
+CB_SYM_PICK = "sym:pick:"        # + <symbol>
+CB_SYM_CUSTOM = "sym:custom"     # fallback — type the symbol manually
+
+
+# Mapping kept small and focused on the instruments most discretionary
+# FX/metals traders actually pick. Anything not listed falls through to
+# a generic chart emoji rather than failing — extending the table
+# costs nothing.
+_SYMBOL_EMOJI: dict[str, str] = {
+    "XAUUSD": "🥇",
+    "XAGUSD": "🥈",
+    "EURUSD": "💶",
+    "GBPUSD": "💷",
+    "USDJPY": "💴",
+    "USDCHF": "🇨🇭",
+    "USDCAD": "🇨🇦",
+    "AUDUSD": "🇦🇺",
+    "NZDUSD": "🇳🇿",
+    "BTCUSD": "₿",
+    "ETHUSD": "Ξ",
+}
+
+
+def _emoji_for(symbol: str) -> str:
+    """Pick a leading emoji for a symbol button.
+
+    Two-step lookup: exact match first, then prefix match so Exness's
+    suffixed variants (``XAUUSDm``, ``EURUSD.s``) inherit their parent
+    pair's emoji without explicit listings.
+    """
+    upper = symbol.upper()
+    if upper in _SYMBOL_EMOJI:
+        return _SYMBOL_EMOJI[upper]
+    for prefix, emoji in _SYMBOL_EMOJI.items():
+        if upper.startswith(prefix):
+            return emoji
+    return "📊"
+
 
 def side_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -114,3 +157,40 @@ def cancel_block_confirm_keyboard(block_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Отмена", callback_data=CB_BLOCK_CANCEL),
         ]]
     )
+
+
+def instrument_picker_keyboard(
+    symbols: "list[str]",
+    *,
+    columns: int = 3,
+) -> InlineKeyboardMarkup:
+    """Quick-pick grid of instruments + ``Другой`` and ``Назад`` row.
+
+    The grid wraps every ``columns`` symbols. A trailing partial row
+    is preserved (so 7 symbols at 3 cols becomes 3+3+1, not 3+3+1+blank).
+    The ``Другой`` button takes the trader to a free-text symbol prompt
+    so unusual names (Exness suffixes, custom CFDs) are still reachable
+    without editing the config.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for sym in symbols:
+        cleaned = sym.strip()
+        if not cleaned:
+            continue
+        row.append(
+            InlineKeyboardButton(
+                text=f"{_emoji_for(cleaned)} {cleaned}",
+                callback_data=f"{CB_SYM_PICK}{cleaned}",
+            )
+        )
+        if len(row) == columns:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text="✏️ Другой", callback_data=CB_SYM_CUSTOM),
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU_BLOCK),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -39,14 +39,18 @@ from futures_bot.bot.keyboards import (
     CB_MENU_STATS,
     CB_SIDE_BUY,
     CB_SIDE_SELL,
+    CB_SYM_CUSTOM,
+    CB_SYM_PICK,
     block_submenu_keyboard,
     cancel_block_confirm_keyboard,
     cancel_block_picker_keyboard,
     confirm_keyboard,
+    instrument_picker_keyboard,
     main_menu_keyboard,
     side_keyboard,
 )
 from futures_bot.bot.states import NewBlockFSM
+from futures_bot.config import Settings
 from futures_bot.core.engine import BlockEngine
 from futures_bot.db import (
     BlockSide,
@@ -143,11 +147,15 @@ async def menu_block(query: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == CB_BLOCK_CREATE)
-async def block_create(query: CallbackQuery, state: FSMContext) -> None:
+async def block_create(
+    query: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
     """Inline 'Создать' button → kick off /newblock FSM."""
     await query.answer()
     if query.message is not None:
-        await cmd_newblock(query.message, state)
+        await cmd_newblock(query.message, state, settings)
 
 
 @router.callback_query(F.data == CB_BLOCK_LIST)
@@ -324,8 +332,19 @@ async def menu_stats(query: CallbackQuery) -> None:
 # ===========================================================================
 
 @router.message(Command("newblock"))
-async def cmd_newblock(message: Message, state: FSMContext) -> None:
+async def cmd_newblock(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
     """Six-step plan builder: symbol → side → 0% → 100% → risk → cancel.
+
+    Step 1 surfaces an instrument picker keyboard sourced from
+    ``settings.quick_symbols`` so the most common pairs are one tap
+    away. The picker also offers a "Другой" button that drops the
+    trader into the free-text path the existing :func:`fsm_symbol`
+    handler already implements — keeping every broker-specific name
+    reachable without editing the keyboard.
 
     Confirm/abort happen via inline keyboard so /cancel can keep its
     meaning as "close a block by id" rather than "abort the current
@@ -335,11 +354,49 @@ async def cmd_newblock(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(NewBlockFSM.SYMBOL)
     await message.answer(
-        "Шаг 1/6 — отправьте символ "
-        "(например, <code>XAUUSD</code>, <code>EURUSD</code>, "
-        "<code>GBPJPY</code>).",
-        parse_mode=ParseMode.HTML,
+        "Шаг 1/6 — выберите инструмент:",
+        reply_markup=instrument_picker_keyboard(settings.quick_symbols_list),
     )
+
+
+@router.callback_query(NewBlockFSM.SYMBOL, F.data.startswith(CB_SYM_PICK))
+async def fsm_symbol_pick(query: CallbackQuery, state: FSMContext) -> None:
+    """Picker button → record symbol, advance to side selection."""
+    if query.data is None or query.message is None:
+        await query.answer()
+        return
+    symbol = query.data[len(CB_SYM_PICK):].strip().upper()
+    # Mirror the validation the text handler runs so a malicious or
+    # corrupted callback doesn't smuggle a bogus value into state.
+    if len(symbol) < 3 or any(c.isspace() for c in symbol):
+        await query.answer("Bad symbol", show_alert=True)
+        return
+    await state.update_data(symbol=symbol)
+    await state.set_state(NewBlockFSM.SIDE)
+    await query.message.answer(
+        f"✅ Выбран: <code>{symbol}</code>\n\n"
+        "Шаг 2/6 — выберите сторону:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=side_keyboard(),
+    )
+    await query.answer()
+
+
+@router.callback_query(NewBlockFSM.SYMBOL, F.data == CB_SYM_CUSTOM)
+async def fsm_symbol_custom(query: CallbackQuery, state: FSMContext) -> None:
+    """`Другой` button → prompt for free-text symbol input.
+
+    Stays in the SYMBOL state so the existing :func:`fsm_symbol`
+    text handler picks up the next message. We only swap the prompt;
+    no state change.
+    """
+    if query.message is not None:
+        await query.message.answer(
+            "Введите символ текстом — например, <code>EURJPY</code>, "
+            "<code>NAS100</code>, или <code>XAUUSDm</code> для Exness mini.",
+            parse_mode=ParseMode.HTML,
+        )
+    await query.answer()
 
 
 @router.message(NewBlockFSM.SYMBOL, F.text)
