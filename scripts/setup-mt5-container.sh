@@ -85,15 +85,27 @@ ok "Container is running"
 # --- Step 3: pin mt5linux 0.1.9 -------------------------------------------
 say "Step 3/5: pinning mt5linux to ${MT5LINUX_PIN} (this may take a minute)"
 
-# Linux-side install. We use --user so we don't fight the system
-# python's externally-managed marker; --force-reinstall makes sure
-# we replace whatever the image shipped with.
+# Linux-side install. The image is Debian Bookworm (Python 3.11),
+# but mt5linux 0.1.9 pins numpy==1.21.4 which doesn't build for
+# Python >= 3.11. The image's own start.sh dodges this by using
+# --no-deps and installing the runtime deps (rpyc, plumbum, numpy)
+# separately — we do the same here.
 say "  - installing on the Linux side..."
 docker exec -u abc "${CONTAINER_NAME}" \
-    pip install --user --no-cache-dir --force-reinstall --break-system-packages \
+    pip install --user --no-cache-dir --force-reinstall --break-system-packages --no-deps \
     "mt5linux==${MT5LINUX_PIN}" > /tmp/mt5linux-linux.log 2>&1 || {
         cat /tmp/mt5linux-linux.log
         die "Linux-side mt5linux install failed (see log above)"
+    }
+# Runtime deps that mt5linux actually needs at import / serve time.
+# Versions left unpinned so pip picks the latest wheel that matches
+# the container's Python; the rigid pins in mt5linux 0.1.9's setup.py
+# don't reflect real compatibility.
+docker exec -u abc "${CONTAINER_NAME}" \
+    pip install --user --no-cache-dir --break-system-packages \
+    rpyc plumbum numpy >> /tmp/mt5linux-linux.log 2>&1 || {
+        cat /tmp/mt5linux-linux.log
+        die "Linux-side mt5linux runtime deps install failed (see log above)"
     }
 ok "  Linux-side mt5linux ${MT5LINUX_PIN} installed"
 
