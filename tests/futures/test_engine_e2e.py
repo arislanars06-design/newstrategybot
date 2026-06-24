@@ -136,6 +136,36 @@ def _utcnow() -> datetime:
 # Tests
 # ---------------------------------------------------------------------
 
+class TestMockAdapterAutoSeed:
+    """The mock auto-seeds a sensible tick on first ``get_tick`` so
+    the Telegram preview doesn't blow up on a fresh process."""
+
+    @pytest.mark.asyncio
+    async def test_known_symbol_seeds_default_tick(
+        self, engine_and_events, xau_spec
+    ) -> None:
+        # Fresh MockAdapter (via the fixture chain) has not had any
+        # tick fed for EURUSD, yet get_tick must still succeed.
+        _engine, _events, broker = engine_and_events
+
+        tick = await broker.get_tick("EURUSD")
+        assert tick.symbol == "EURUSD"
+        assert tick.bid < tick.ask
+        # Spread is roughly the symbol's typical 0.8 pip.
+        assert 0.00007 < tick.spread < 0.00009
+
+    @pytest.mark.asyncio
+    async def test_unknown_symbol_still_raises(
+        self, engine_and_events, xau_spec
+    ) -> None:
+        _engine, _events, broker = engine_and_events
+
+        with pytest.raises(ValueError) as exc:
+            await broker.get_tick("WTFCOIN")
+        # Message should hint at the fix so the operator isn't stuck.
+        assert "feed_tick" in str(exc.value) or "_DEFAULT" in str(exc.value)
+
+
 class TestCreateBlock:
     """``engine.create_block`` places the six limits and notifies."""
 

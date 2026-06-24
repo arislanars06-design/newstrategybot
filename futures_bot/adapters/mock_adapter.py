@@ -91,6 +91,32 @@ _DEFAULT_SYMBOLS: dict[str, SymbolInfo] = {
 }
 
 
+# Plausible mid prices used to seed an initial tick on first
+# ``get_tick`` for symbols the trader hasn't fed manually. Anchors
+# the mock close to real Exness quotes so the Telegram preview
+# numbers look familiar without burdening the trader with extra
+# setup steps. Bid/ask are mid ± half the symbol's typical spread.
+_DEFAULT_MID_PRICES: dict[str, float] = {
+    "XAUUSD": 2640.40,
+    "EURUSD": 1.08510,
+    "GBPUSD": 1.27000,
+    # The following symbols don't have a SymbolInfo above, so they
+    # would still fail on get_symbol_info(); the mid prices are here
+    # for when more symbols are added to _DEFAULT_SYMBOLS later.
+    "USDJPY": 150.25,
+    "GBPJPY": 190.50,
+    "EURJPY": 162.45,
+    "AUDJPY": 100.30,
+    "AUDUSD": 0.65500,
+    "NZDUSD": 0.60500,
+    "USDCAD": 1.36000,
+    "USDCHF": 0.88000,
+    "GBPAUD": 1.93500,
+    "GBPCAD": 1.72500,
+    "EURGBP": 0.85400,
+}
+
+
 @dataclass
 class _PendingOrder:
     """Server-side bookkeeping for a not-yet-filled limit order."""
@@ -171,11 +197,33 @@ class MockAdapter(BrokerAdapter):
 
     async def get_tick(self, symbol: str) -> Tick:
         tick = self._ticks.get(symbol)
-        if tick is None:
+        if tick is not None:
+            return tick
+
+        # Auto-seed a plausible mid-price tick on first lookup. Without
+        # this, every call to /newblock against a fresh mock raises
+        # because no test code has called feed_tick() yet — and in the
+        # Telegram-only bring-up flow there *is* no such test code.
+        # Only seed for symbols we already know how to size: the
+        # SymbolInfo catalogue is the single source of truth.
+        info = self._symbols.get(symbol)
+        mid = _DEFAULT_MID_PRICES.get(symbol)
+        if info is None or mid is None:
             raise ValueError(
-                f"no tick has been fed for {symbol!r}; call feed_tick first"
+                f"no tick has been fed for {symbol!r} and no default "
+                f"price is registered; either call feed_tick() or add "
+                f"the symbol to _DEFAULT_SYMBOLS / _DEFAULT_MID_PRICES."
             )
-        return tick
+
+        half_spread = info.spread_typical / 2.0
+        seeded = Tick(
+            symbol=symbol,
+            bid=round(mid - half_spread, info.digits),
+            ask=round(mid + half_spread, info.digits),
+            time=_utcnow(),
+        )
+        self._ticks[symbol] = seeded
+        return seeded
 
     async def get_account_balance(self) -> float:
         return self._balance

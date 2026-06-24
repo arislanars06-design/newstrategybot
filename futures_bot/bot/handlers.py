@@ -335,7 +335,7 @@ async def cmd_newblock(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(NewBlockFSM.SYMBOL)
     await message.answer(
-        "Шаг 1/6 — отправьте символ "
+        "Шаг 1/5 — отправьте символ "
         "(например, <code>XAUUSD</code>, <code>EURUSD</code>, "
         "<code>GBPJPY</code>).",
         parse_mode=ParseMode.HTML,
@@ -353,7 +353,7 @@ async def fsm_symbol(message: Message, state: FSMContext) -> None:
     await state.update_data(symbol=symbol)
     await state.set_state(NewBlockFSM.SIDE)
     await message.answer(
-        "Шаг 2/6 — выберите сторону:",
+        "Шаг 2/5 — выберите сторону:",
         reply_markup=side_keyboard(),
     )
 
@@ -366,7 +366,7 @@ async def fsm_side(query: CallbackQuery, state: FSMContext) -> None:
     msg = query.message
     if msg is not None:
         await msg.answer(
-            "Шаг 3/6 — отправьте цену <b>0%</b> якоря.\n"
+            "Шаг 3/5 — отправьте цену <b>0%</b> якоря.\n"
             "Для BUY это <b>верх</b> диапазона; для SELL — <b>низ</b>.",
             parse_mode=ParseMode.HTML,
         )
@@ -382,7 +382,7 @@ async def fsm_zero_price(message: Message, state: FSMContext) -> None:
     await state.update_data(zero_price=price)
     await state.set_state(NewBlockFSM.HUNDRED_PRICE)
     await message.answer(
-        "Шаг 4/6 — отправьте цену <b>100%</b> якоря "
+        "Шаг 4/5 — отправьте цену <b>100%</b> якоря "
         "(противоположный конец диапазона).",
         parse_mode=ParseMode.HTML,
     )
@@ -397,47 +397,39 @@ async def fsm_hundred_price(message: Message, state: FSMContext) -> None:
     await state.update_data(hundred_price=price)
     await state.set_state(NewBlockFSM.BASE_RISK)
     await message.answer(
-        "Шаг 5/6 — <b>базовый риск</b> в USD на 1-й ордер.\n"
+        "Шаг 5/5 — <b>базовый риск</b> в USD на 1-й ордер.\n"
         "Остальные ордера получат 1.5×, 2.25×, 3.375×, 5.06×, 7.59× "
-        "от этой суммы.",
+        "от этой суммы.\n\n"
+        "<i>Цена отмены берётся автоматически из 0% якоря.</i>",
         parse_mode=ParseMode.HTML,
     )
 
 
 @router.message(NewBlockFSM.BASE_RISK, F.text)
-async def fsm_base_risk(message: Message, state: FSMContext) -> None:
+async def fsm_base_risk(
+    message: Message,
+    state: FSMContext,
+    adapter: BrokerAdapter,
+) -> None:
+    """Final FSM step: receive base risk, build and preview the plan.
+
+    No cancel-price prompt — the 0% anchor doubles as the
+    invalidation level. For a BUY block that anchor sits above every
+    entry, for a SELL block below every entry; either way it makes a
+    natural cancel-on-touch barrier.
+    """
     risk = _parse_float(message.text)
     if risk is None or risk <= 0:
         await message.answer("Отправьте одно положительное число.")
         return
     await state.update_data(base_risk=risk)
-    await state.set_state(NewBlockFSM.CANCEL_PRICE)
-    await message.answer(
-        "Шаг 6/6 — <b>цена отмены</b>.\n"
-        "Если рынок достигнет её до первого срабатывания — все "
-        "ордера будут отменены, блок станет INVALID.\n\n"
-        "Для BUY: <i>выше</i> 0% якоря. Для SELL: <i>ниже</i>.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(NewBlockFSM.CANCEL_PRICE, F.text)
-async def fsm_cancel_price(
-    message: Message,
-    state: FSMContext,
-    adapter: BrokerAdapter,
-) -> None:
-    cancel = _parse_float(message.text)
-    if cancel is None or cancel <= 0:
-        await message.answer("Отправьте одно положительное число.")
-        return
 
     data = await state.get_data()
     symbol: str = data["symbol"]
     side = BlockSide(data["side"])
     zero_price: float = data["zero_price"]
     hundred_price: float = data["hundred_price"]
-    base_risk: float = data["base_risk"]
+    cancel_price = zero_price  # automatic — see FSM docstring
 
     # Pull live broker spec + spread so we can size the lot correctly
     # and validate the range against the live spread before the trader
@@ -447,7 +439,9 @@ async def fsm_cancel_price(
         tick = await adapter.get_tick(symbol)
     except Exception as exc:  # noqa: BLE001
         logger.exception("symbol/tick fetch failed")
-        await _reply_plain(message, f"❌ Не удалось получить данные по {symbol}: {exc}")
+        await _reply_plain(
+            message, f"❌ Не удалось получить данные по {symbol}: {exc}"
+        )
         await state.clear()
         return
 
@@ -460,16 +454,18 @@ async def fsm_cancel_price(
         volume_step=info.volume_step,
     )
 
-    # Build the plan — this also validates anchor orientation and
-    # cancel-price side relative to the ladder.
+    # Build the plan — this also validates anchor orientation. The
+    # cancel-price orientation check is automatically satisfied
+    # because cancel_price == zero_price, and zero_price lies on the
+    # correct side of the ladder by construction.
     try:
         plan = build_plan(
             symbol=symbol,
             side=side,
             zero_price=zero_price,
             hundred_price=hundred_price,
-            base_risk_usd=base_risk,
-            cancel_price=cancel,
+            base_risk_usd=risk,
+            cancel_price=cancel_price,
             symbol_spec=symbol_spec,
             lot_rounding="up",
         )
@@ -478,9 +474,8 @@ async def fsm_cancel_price(
         await state.clear()
         return
 
-    # Stash the plan so the confirm step can recover it cheaply. We
-    # serialise just enough to reconstruct it; the full dataclass
-    # would not survive FSM JSON storage.
+    # Stash just enough to rebuild the plan in the confirm step. The
+    # full dataclass would not survive FSM JSON storage round-trip.
     await state.update_data(
         plan_payload={
             "symbol": plan.symbol,
