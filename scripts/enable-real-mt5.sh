@@ -49,6 +49,52 @@ die()  { printf "${RED}[ERR]${NC} %s\n" "$*" >&2; exit 1; }
 [[ -f "${ENV_FILE}" ]] || die "${ENV_FILE} not found. Run this from the repo root."
 command -v systemctl >/dev/null 2>&1 || die "systemctl not available"
 
+# --- Host-side mt5linux client library -------------------------------------
+#
+# The bot runs on the host under systemd, so it needs the mt5linux
+# Python package available to its interpreter (the RPC client side).
+# We pin to the same 0.1.9 as the container's server side and dodge
+# the broken numpy pin the same way: --no-deps then install the
+# real runtime deps unpinned.
+ensure_host_mt5linux() {
+    # Resolve which Python the service uses by parsing the unit's
+    # ExecStart. Falls back to /usr/bin/python3 if anything is
+    # unusual; that matches a from-source install with `pip install -e .`.
+    local exec_line
+    exec_line=$(systemctl cat "${SERVICE_NAME}" 2>/dev/null \
+        | grep -E '^ExecStart=' | head -n1 | sed -E 's/^ExecStart=//')
+    local svc_python
+    svc_python=$(printf '%s' "${exec_line}" | awk '{print $1}')
+    if [[ -z "${svc_python}" || ! -x "${svc_python}" ]]; then
+        svc_python="/usr/bin/python3"
+    fi
+
+    if "${svc_python}" -c 'import mt5linux' >/dev/null 2>&1; then
+        ok "host already has mt5linux available (${svc_python})"
+        return 0
+    fi
+
+    say "  - installing mt5linux 0.1.9 for ${svc_python}..."
+    "${svc_python}" -m pip install --break-system-packages --no-cache-dir \
+        --no-deps --force-reinstall "mt5linux==0.1.9" \
+        > /tmp/mt5linux-host.log 2>&1 || {
+            cat /tmp/mt5linux-host.log
+            die "host-side mt5linux install failed (see log above)"
+        }
+    "${svc_python}" -m pip install --break-system-packages --no-cache-dir \
+        rpyc plumbum numpy >> /tmp/mt5linux-host.log 2>&1 || {
+            cat /tmp/mt5linux-host.log
+            die "host-side mt5linux runtime deps install failed (see log above)"
+        }
+    if ! "${svc_python}" -c 'import mt5linux' >/dev/null 2>&1; then
+        die "post-install import of mt5linux still fails — inspect /tmp/mt5linux-host.log"
+    fi
+    ok "host-side mt5linux installed (${svc_python})"
+}
+
+say "Step 0/3: ensuring host has the mt5linux client library"
+ensure_host_mt5linux
+
 # --- Helper: read/write/upsert a KEY=VALUE line in .env -------------------
 #
 # We intentionally do this with plain awk-free shell so the file order
