@@ -90,7 +90,7 @@ say "Step 3/5: pinning mt5linux to ${MT5LINUX_PIN} (this may take a minute)"
 # we replace whatever the image shipped with.
 say "  - installing on the Linux side..."
 docker exec -u abc "${CONTAINER_NAME}" \
-    pip install --user --no-cache-dir --force-reinstall \
+    pip install --user --no-cache-dir --force-reinstall --break-system-packages \
     "mt5linux==${MT5LINUX_PIN}" > /tmp/mt5linux-linux.log 2>&1 || {
         cat /tmp/mt5linux-linux.log
         die "Linux-side mt5linux install failed (see log above)"
