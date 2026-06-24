@@ -1,0 +1,43 @@
+# Futures bot container.
+#
+# The bot runs alongside (not on top of) the MT5 + Wine container; the
+# two talk over the docker-compose network at "mt5:8001". This image is
+# a thin Python runtime — no Wine, no graphical libraries — so it
+# starts in seconds and stays under 200 MB.
+
+FROM python:3.11-slim AS base
+
+# Avoid timezone prompts; keep Python output unbuffered so logs surface
+# in real time under journald / docker logs.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# Install the bot's dependencies first so the layer cache survives
+# code-only changes. ``mt5linux`` is the client side of the RPC
+# bridge; the actual MetaTrader5 install lives in the MT5 container.
+COPY pyproject.toml /app/pyproject.toml
+RUN pip install --no-cache-dir \
+    aiogram==3.* \
+    pydantic==2.* \
+    pydantic-settings==2.* \
+    sqlalchemy[asyncio]==2.* \
+    aiosqlite \
+    loguru \
+    "mt5linux>=0.1.9"
+
+# Copy the futures bot package only — the crypto bot source tree
+# isn't needed inside this container.
+COPY futures_bot /app/futures_bot
+
+# Runtime directories — bind-mounted in docker-compose so logs and the
+# SQLite DB survive container restarts.
+RUN mkdir -p /app/logs /app/data
+
+USER nobody:nogroup
+
+CMD ["python", "-m", "futures_bot.main"]

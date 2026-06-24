@@ -1,0 +1,60 @@
+# Local + production runtime for the futures bot.
+#
+# Spins up two services:
+#
+#   mt5         — Wine + MetaTrader 5 terminal with mt5linux RPC server.
+#                 First-time setup requires a one-shot login to your
+#                 Exness account through the VNC port; afterwards the
+#                 credentials are cached on the named volume.
+#
+#   futures-bot — the Python bot itself. Talks to mt5 over the
+#                 docker-compose network at "mt5:8001" and to Telegram
+#                 over the host's outbound network.
+#
+# The crypto bot runs as a separate process (or its own docker image)
+# and is not touched by this compose file.
+
+version: "3.9"
+
+services:
+  mt5:
+    # Headless Wine + MT5 image maintained by gmag11 — the same one
+    # we discussed for the manual setup. VNC port 5900 lets you point
+    # a VNC client at the container for the one-time Exness login.
+    image: gmag11/metatrader5_vnc:latest
+    container_name: futures-mt5
+    restart: unless-stopped
+    environment:
+      # Optional VNC password — the password protects the one-shot
+      # login session, not actual trading credentials.
+      CUSTOM_USER: ${MT5_VNC_USER:-trader}
+      PASSWORD: ${MT5_VNC_PASSWORD:-changeme}
+    ports:
+      - "127.0.0.1:5900:5900"    # VNC (host-only by default)
+      - "127.0.0.1:8001:8001"    # mt5linux RPC (host-only by default)
+    volumes:
+      - mt5_data:/config
+
+  futures-bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.futures
+    container_name: futures-bot
+    restart: unless-stopped
+    depends_on:
+      - mt5
+    # The bot reads everything from ../.env so credentials never live
+    # in this compose file.
+    env_file:
+      - ../.env
+    environment:
+      # Override these two so the in-container bot talks to the mt5
+      # service over the docker network rather than 127.0.0.1.
+      FB_MT5_HOST: mt5
+      FB_MT5_PORT: 8001
+    volumes:
+      - ../logs:/app/logs
+      - ../data:/app/data
+
+volumes:
+  mt5_data:

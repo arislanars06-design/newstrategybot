@@ -54,3 +54,4 @@ htmlcov/
 
 # Alembic
 # (keep migrations folder, but not generated artifacts)
+.python-version
