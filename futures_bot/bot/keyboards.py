@@ -36,6 +36,56 @@ CB_BLOCK_CANCEL = "block:cancel"
 CB_CANCEL_BLOCK_PICK = "cb:pick:"        # + <block_id>
 CB_CANCEL_BLOCK_CONFIRM = "cb:confirm:"  # + <block_id>
 
+# --- Symbol picker for /newblock ---
+CB_SYMBOL_PICK = "sym:"                  # + <symbol>
+
+
+# Symbols grouped by how well they fit the uniform-Fibonacci strategy.
+# Tier emojis are passed through to the keyboard label so the trader
+# can spot the recommended pairs at a glance without needing to read
+# the strategy spec each time.
+#
+# Tier rationale (compressed from the planning conversation):
+#   🥇 — daily range fits a 6-rung block comfortably + low effective spread
+#   🥈 — workable but needs trend day or slightly wider block
+#   🥉 — only on a strong move; spread/range ratio is tight
+#   ⚠️  — listed for completeness only; not recommended for live trading
+SYMBOL_TIERS: list[tuple[str, str]] = [
+    # Tier A — the "always available" instruments for this strategy.
+    ("XAUUSD", "🥇"),
+    ("GBPJPY", "🥇"),
+    ("EURJPY", "🥇"),
+    ("GBPAUD", "🥇"),
+    ("GBPCAD", "🥇"),
+    ("GBPUSD", "🥇"),
+    ("USDJPY", "🥇"),
+    ("AUDJPY", "🥇"),
+    # Tier B — workable.
+    ("EURUSD", "🥈"),
+    ("EURAUD", "🥈"),
+    ("AUDUSD", "🥈"),
+    ("USDCAD", "🥈"),
+    # Tier C — caution.
+    ("NZDJPY", "🥉"),
+    ("CADJPY", "🥉"),
+    ("CHFJPY", "🥉"),
+    ("GBPNZD", "🥉"),
+    ("NZDUSD", "🥉"),
+    ("USDCHF", "🥉"),
+    # Tier D — listed for completeness; trader should know the caveats.
+    ("EURGBP", "⚠️"),
+    ("EURCHF", "⚠️"),
+    ("EURCAD", "⚠️"),
+    ("EURNZD", "⚠️"),
+    ("GBPCHF", "⚠️"),
+    ("AUDCAD", "⚠️"),
+    ("AUDCHF", "⚠️"),
+    ("AUDNZD", "⚠️"),
+    ("NZDCAD", "⚠️"),
+    ("NZDCHF", "⚠️"),
+    ("CADCHF", "⚠️"),
+]
+
 
 def side_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -114,3 +164,30 @@ def cancel_block_confirm_keyboard(block_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Отмена", callback_data=CB_BLOCK_CANCEL),
         ]]
     )
+
+
+def symbol_picker_keyboard(*, columns: int = 3) -> InlineKeyboardMarkup:
+    """Inline keyboard with every supported symbol, tier-prefixed.
+
+    The strategy works with 29 instruments; rendering them as buttons
+    saves the trader from typing each name (and from typo errors).
+    Buttons are flowed left-to-right in ``columns`` per row — three
+    fits comfortably on a phone for the 6-character names. The order
+    is fixed in :data:`SYMBOL_TIERS` so muscle memory holds across
+    sessions.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for symbol, tier in SYMBOL_TIERS:
+        row.append(
+            InlineKeyboardButton(
+                text=f"{tier} {symbol}",
+                callback_data=f"{CB_SYMBOL_PICK}{symbol}",
+            )
+        )
+        if len(row) == columns:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)

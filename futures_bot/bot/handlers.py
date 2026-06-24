@@ -11,6 +11,8 @@ plus a base risk are enough to produce a fully-sized plan.
 
 from __future__ import annotations
 
+from html import escape as _h
+
 from aiogram import F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -39,12 +41,15 @@ from futures_bot.bot.keyboards import (
     CB_MENU_STATS,
     CB_SIDE_BUY,
     CB_SIDE_SELL,
+    CB_SYMBOL_PICK,
+    SYMBOL_TIERS,
     block_submenu_keyboard,
     cancel_block_confirm_keyboard,
     cancel_block_picker_keyboard,
     confirm_keyboard,
     main_menu_keyboard,
     side_keyboard,
+    symbol_picker_keyboard,
 )
 from futures_bot.bot.states import NewBlockFSM
 from futures_bot.core.engine import BlockEngine
@@ -301,6 +306,46 @@ async def cmd_balance(message: Message, adapter: BrokerAdapter) -> None:
     )
 
 
+@router.message(Command("symbols"))
+async def cmd_symbols(message: Message) -> None:
+    """Print the supported-symbol catalogue with tier markers.
+
+    Renders the same ``SYMBOL_TIERS`` table the /newblock keyboard
+    uses, but in a scrollable text form so the trader can refer to
+    it without starting an FSM. Especially handy on phones where
+    the keyboard grid takes effort to scroll through.
+    """
+    tier_label = {
+        "🥇": "Рекомендованные",
+        "🥈": "Хорошие",
+        "🥉": "С оговорками",
+        "⚠️": "Риск (не рекомендуется)",
+    }
+    grouped: dict[str, list[str]] = {}
+    for symbol, tier in SYMBOL_TIERS:
+        grouped.setdefault(tier, []).append(symbol)
+
+    lines: list[str] = ["📊 <b>Доступные символы</b>", ""]
+    # Iterate in the same order tiers are defined in SYMBOL_TIERS so
+    # the output matches the keyboard.
+    seen: set[str] = set()
+    for _, tier in SYMBOL_TIERS:
+        if tier in seen:
+            continue
+        seen.add(tier)
+        header = f"{tier} <b>{_h(tier_label.get(tier, tier))}</b>"
+        symbols_text = "   ".join(
+            f"<code>{_h(s)}</code>" for s in grouped[tier]
+        )
+        lines.extend([header, symbols_text, ""])
+
+    lines.append(
+        "Используйте <code>/newblock</code> для создания блока — "
+        "символы можно выбрать через инлайн-кнопки."
+    )
+    await _reply_html(message, "\n".join(lines))
+
+
 @router.callback_query(F.data == CB_MENU_BALANCE)
 async def menu_balance(query: CallbackQuery, adapter: BrokerAdapter) -> None:
     await query.answer()
@@ -325,21 +370,47 @@ async def menu_stats(query: CallbackQuery) -> None:
 
 @router.message(Command("newblock"))
 async def cmd_newblock(message: Message, state: FSMContext) -> None:
-    """Six-step plan builder: symbol → side → 0% → 100% → risk → cancel.
+    """Six-step plan builder: symbol → side → 0% → 100% → risk → confirm.
 
-    Confirm/abort happen via inline keyboard so /cancel can keep its
-    meaning as "close a block by id" rather than "abort the current
-    FSM". To bail out mid-FSM the trader presses the ❌ Отмена button
-    on the confirm screen or types /menu (which clears state).
+    Cancel-price is taken from the 0% anchor automatically — see
+    ``NewBlockFSM`` docstring. The trader picks the symbol from an
+    inline keyboard listing all 29 supported instruments, but can
+    still type a custom symbol name if needed (broker-side validity
+    is checked when the live tick is fetched).
     """
     await state.clear()
     await state.set_state(NewBlockFSM.SYMBOL)
     await message.answer(
-        "Шаг 1/5 — отправьте символ "
-        "(например, <code>XAUUSD</code>, <code>EURUSD</code>, "
-        "<code>GBPJPY</code>).",
+        "Шаг 1/5 — выберите символ:\n\n"
+        "🥇 рекомендованные · 🥈 хорошие · 🥉 с оговорками · ⚠️ риск\n\n"
+        "<i>Либо отправьте название текстом, если нужного нет в списке.</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=symbol_picker_keyboard(),
     )
+
+
+@router.callback_query(NewBlockFSM.SYMBOL, F.data.startswith(CB_SYMBOL_PICK))
+async def fsm_symbol_picked(query: CallbackQuery, state: FSMContext) -> None:
+    """Inline-keyboard variant of the symbol step.
+
+    Mirrors :func:`fsm_symbol` but reads the symbol from the callback
+    data instead of message text, so a single tap advances the FSM.
+    """
+    if query.data is None:
+        await query.answer()
+        return
+    symbol = query.data[len(CB_SYMBOL_PICK):]
+    await state.update_data(symbol=symbol)
+    await state.set_state(NewBlockFSM.SIDE)
+    msg = query.message
+    if msg is not None:
+        await msg.answer(
+            f"Символ: <code>{_h(symbol)}</code>\n\n"
+            "Шаг 2/5 — выберите сторону:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=side_keyboard(),
+        )
+    await query.answer()
 
 
 @router.message(NewBlockFSM.SYMBOL, F.text)
@@ -353,7 +424,9 @@ async def fsm_symbol(message: Message, state: FSMContext) -> None:
     await state.update_data(symbol=symbol)
     await state.set_state(NewBlockFSM.SIDE)
     await message.answer(
+        f"Символ: <code>{_h(symbol)}</code>\n\n"
         "Шаг 2/5 — выберите сторону:",
+        parse_mode=ParseMode.HTML,
         reply_markup=side_keyboard(),
     )
 

@@ -31,11 +31,15 @@ def build_bot(settings: Settings) -> Bot:
 
 # Only the two entry-point commands are advertised in Telegram's
 # slash-menu autocomplete. /newblock / /list / /block / /cancel /
-# /balance still work — they just aren't pushed at the trader on
-# every chat.
+# /symbols / /balance still work — they just aren't pushed at the
+# trader on every chat.
 ADVERTISED_COMMANDS: list[BotCommand] = [
     BotCommand(command="start", description="Открыть главное меню"),
     BotCommand(command="menu", description="Главное меню"),
+    BotCommand(command="newblock", description="Создать блок"),
+    BotCommand(command="list", description="Активные блоки"),
+    BotCommand(command="symbols", description="Список доступных символов"),
+    BotCommand(command="balance", description="Баланс счёта"),
 ]
 
 
