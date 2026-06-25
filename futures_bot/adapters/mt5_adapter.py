@@ -85,6 +85,48 @@ _SUCCESS_RETCODES = frozenset(
     {_TRADE_RETCODE_PLACED, _TRADE_RETCODE_DONE, _TRADE_RETCODE_DONE_PARTIAL}
 )
 
+
+# Map MT5 retcodes to operator-actionable remediation hints. The
+# raw ``comment`` field from the broker is too terse ("AutoTrading
+# disabled by client" doesn't tell you to press Ctrl+E in MT5);
+# these hints get appended so the Telegram notification points the
+# trader at the exact fix. Codes not in this table fall back to
+# the broker's comment field, which is fine for "Invalid stops"-
+# class errors that need a strategy tweak rather than a setup tweak.
+_RETCODE_HINTS: dict[int, str] = {
+    10004:  # REQUOTE
+        "Брокер запросил новую котировку. Спред нестабилен — "
+        "повторите попытку или дождитесь спокойного рынка.",
+    10006:  # REJECT
+        "Заявка отклонена брокером. Проверьте, не закрыт ли "
+        "рынок по этому символу.",
+    10013:  # INVALID_REQUEST
+        "Запрос отклонён как недопустимый. Проверьте размер лота "
+        "и шаг volume_step символа.",
+    10014:  # INVALID_VOLUME
+        "Некорректный объём. Лот меньше volume_min или не "
+        "кратен volume_step.",
+    10015:  # INVALID_PRICE
+        "Цена ордера далеко от текущей. Возможно, неверный "
+        "символ или биржа закрыта.",
+    10016:  # INVALID_STOPS
+        "SL/TP слишком близко к цене. Расширьте диапазон 0%/100% "
+        "или уменьшите количество знаков точности символа.",
+    10018:  # MARKET_CLOSED
+        "Рынок закрыт. Откройте блок в торговые часы инструмента.",
+    10019:  # NO_MONEY
+        "Недостаточно свободной маржи. Уменьшите base_risk или "
+        "проверьте кредитное плечо аккаунта.",
+    10027:  # AUTO_TRADING_DISABLED
+        "Включите AutoTrading в MT5: в верхней панели нажмите "
+        "иконку «AutoTrading» (или Ctrl+E). Без неё терминал "
+        "блокирует любые автоматические заявки.",
+    10030:  # INVALID_FILL
+        "Брокер не принимает выбранный режим заполнения. "
+        "Обычно лечится переключением IOC/FOK — сообщите боту, "
+        "какой ваш символ требует.",
+}
+
 # MT5 caps the order comment at 31 characters; truncate defensively.
 _COMMENT_MAX_LEN = 31
 
@@ -696,6 +738,30 @@ def _translate_order_send_result(result: Any) -> OrderResult:
         filled_price=price if price > 0 else None,
         error_code=retcode if not ok else None,
         error_message=(
-            None if ok else (str(getattr(result, "comment", "")) or f"retcode={retcode}")
+            None if ok else _format_error_message(result, retcode)
         ),
     )
+
+
+def _format_error_message(result: Any, retcode: int) -> str:
+    """Build the human-readable error message attached to a failed result.
+
+    Combines the broker's terse ``comment`` field (always present)
+    with an operator-actionable remediation hint from
+    :data:`_RETCODE_HINTS` when available. Surfaces the retcode as
+    a numeric fallback when both are empty.
+
+    The Telegram notifier formats this as a single line per the
+    existing engine convention; the hint is short enough to fit
+    comfortably alongside the broker comment.
+    """
+    comment = str(getattr(result, "comment", "") or "").strip()
+    hint = _RETCODE_HINTS.get(retcode)
+
+    if comment and hint:
+        return f"{retcode} {comment} — {hint}"
+    if comment:
+        return f"{retcode} {comment}"
+    if hint:
+        return f"{retcode}: {hint}"
+    return f"retcode={retcode}"

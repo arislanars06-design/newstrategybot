@@ -87,24 +87,57 @@ class TestTranslateOrderSendResult:
 
     def test_rejected_retcode_propagates_error(self) -> None:
         # 10004 = TRADE_RETCODE_REQUOTE — typical "no fill" case.
+        # The translated message now combines the broker's terse
+        # comment with the actionable hint; both strings must be
+        # present so the operator gets both signal and remediation.
         raw = _FakeResult(
             retcode=10004, order=0, deal=0, price=0.0, comment="Requote"
         )
         r = _translate_order_send_result(raw)
         assert not r.ok
         assert r.error_code == 10004
-        assert r.error_message == "Requote"
+        assert r.error_message is not None
+        assert "Requote" in r.error_message
+        # Hint mentions the spread / retry guidance.
+        assert "повторите" in r.error_message.lower()
         assert r.ticket is None
         assert r.position_ticket is None
 
-    def test_failed_result_with_empty_comment_falls_back_to_code(self) -> None:
+    def test_failed_result_with_empty_comment_falls_back_to_hint(self) -> None:
+        # When the broker forgets the comment but we know the
+        # retcode, the trader still gets actionable text — the
+        # hint stands in for the missing comment.
         raw = _FakeResult(retcode=10006, order=0, deal=0, comment="")
         r = _translate_order_send_result(raw)
         assert not r.ok
-        # When the broker forgets to attach a human message we surface
-        # the bare retcode rather than an empty string — at least the
-        # operator can grep for it.
-        assert r.error_message == "retcode=10006"
+        assert r.error_message is not None
+        # The hint covers retcode 10006 (REJECT).
+        assert "10006" in r.error_message
+        assert "отклонена" in r.error_message.lower()
+
+    def test_failed_result_with_unknown_retcode_falls_back_to_numeric(self) -> None:
+        # Genuinely unknown retcode + missing comment: we surface
+        # the bare retcode so the operator can grep / report it.
+        raw = _FakeResult(retcode=99999, order=0, deal=0, comment="")
+        r = _translate_order_send_result(raw)
+        assert r.error_message == "retcode=99999"
+
+    def test_auto_trading_disabled_message_points_at_ctrl_e(self) -> None:
+        # Specific regression check for the most common live-test
+        # tripwire: the trader hits "Создать", the bot sends, MT5
+        # rejects because AutoTrading is off. The previous wording
+        # ("AutoTrading disabled by client") sent operators hunting
+        # through forums; this hint tells them exactly which button.
+        raw = _FakeResult(
+            retcode=10027, order=0, deal=0,
+            comment="AutoTrading disabled by client",
+        )
+        r = _translate_order_send_result(raw)
+        assert not r.ok
+        assert r.error_message is not None
+        # Combine broker comment + Ctrl+E hint in one line.
+        assert "AutoTrading disabled by client" in r.error_message
+        assert "Ctrl+E" in r.error_message
 
 
 class TestPickMarketFilling:
