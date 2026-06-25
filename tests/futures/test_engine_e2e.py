@@ -195,6 +195,49 @@ class TestCancelPriceInvalid:
         types = [n.type for n in events]
         assert NotificationType.BLOCK_INVALID in types
 
+    @pytest.mark.asyncio
+    async def test_double_cancel_tick_does_not_fire_invalid_twice(
+        self, engine_and_events, xau_spec
+    ) -> None:
+        """Two ticks past cancel emit BLOCK_INVALID exactly once.
+
+        Reproduces a live-test issue where the duplicate ⚫ INVALID
+        message was hitting the channel twice in quick succession.
+        Without the idempotency guard in _handle_cancel_price_hit,
+        the second tick re-runs the handler against the now-INVALID
+        block and emits another notification.
+        """
+        engine, events, broker = engine_and_events
+
+        await broker.feed_tick(
+            Tick(symbol="XAUUSD", bid=2640.30, ask=2640.50, time=_utcnow())
+        )
+        plan = _make_xauusd_plan(xau_spec)
+        block = await engine.create_block(plan, chat_id=42)
+
+        # First tick: crosses the cancel line.
+        kill_tick = Tick(
+            symbol="XAUUSD", bid=2654.90, ask=2655.10, time=_utcnow()
+        )
+        await engine.on_tick(kill_tick)
+        # Second tick a beat later, still past cancel.
+        kill_tick_2 = Tick(
+            symbol="XAUUSD", bid=2655.10, ask=2655.30, time=_utcnow()
+        )
+        await engine.on_tick(kill_tick_2)
+
+        invalid_count = sum(
+            1 for n in events if n.type == NotificationType.BLOCK_INVALID
+        )
+        assert invalid_count == 1, (
+            f"BLOCK_INVALID fired {invalid_count} times — expected 1"
+        )
+
+        # And the block is still INVALID (no flip / re-open).
+        async with session_scope() as session:
+            fresh = await repository.get_block(session, block.id)
+        assert fresh.status == BlockStatus.INVALID
+
 
 class TestSingleRungWin:
     """Rung 1 fills, price reverses, TP hits → BLOCK_WIN."""

@@ -729,6 +729,38 @@ async def fsm_base_risk(
         await state.clear()
         return
 
+    # Pre-flight: the cancel-price guard is anchored at ``zero_price``.
+    # If the current market is already past that line, the engine
+    # would invalidate the block on the very next tick — wasting the
+    # six broker round-trips on a doomed setup. Reject here with a
+    # message that names the exact mistake so the trader can retry
+    # without having to read the (silent) INVALID notification.
+    mid = (tick.ask + tick.bid) / 2.0
+    if side == BlockSide.BUY and mid >= zero_price:
+        await _reply_plain(
+            message,
+            f"❌ Текущая цена ({round(mid, 5)}) уже выше якоря "
+            f"0% ({zero_price}).\n\n"
+            "Для BUY якорь 0% должен быть ВЫШЕ текущей цены — "
+            "это верх ожидаемого отката. Иначе блок будет "
+            "немедленно отменён по cancel-price.\n\n"
+            "Попробуйте /newblock ещё раз с более высоким 0%.",
+        )
+        await state.clear()
+        return
+    if side == BlockSide.SELL and mid <= zero_price:
+        await _reply_plain(
+            message,
+            f"❌ Текущая цена ({round(mid, 5)}) уже ниже якоря "
+            f"0% ({zero_price}).\n\n"
+            "Для SELL якорь 0% должен быть НИЖЕ текущей цены — "
+            "это низ ожидаемого отката. Иначе блок будет "
+            "немедленно отменён по cancel-price.\n\n"
+            "Попробуйте /newblock ещё раз с более низким 0%.",
+        )
+        await state.clear()
+        return
+
     symbol_spec = SymbolSpec(
         symbol=info.symbol,
         trade_tick_size=info.trade_tick_size,

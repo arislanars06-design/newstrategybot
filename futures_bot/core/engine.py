@@ -641,6 +641,17 @@ class BlockEngine:
         block: Block,
         tick: Tick,
     ) -> None:
+        """Cancel all pendings, mark block INVALID, notify.
+
+        Idempotent: returns silently if the block has already moved
+        into a terminal state. Without this guard a race between
+        successive TickWatcher iterations (which take their snapshot
+        of active blocks outside the cancel transaction) can fire
+        BLOCK_INVALID twice — that's how the live ticker saw
+        duplicate ⚫ messages.
+        """
+        if block.status not in (BlockStatus.CREATED, BlockStatus.ACTIVE):
+            return
         """Cancel-price hit before any fill → block becomes INVALID."""
         for o in block.orders:
             if o.state == OrderState.PENDING and o.entry_ticket:
