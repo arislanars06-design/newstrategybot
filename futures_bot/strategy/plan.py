@@ -81,7 +81,11 @@ class BlockPlan:
     # order-watcher and notifier don't recompute it.
     sl_distance: float
 
-    cancel_price: float
+    # Cancel-price guard. ``None`` disables the guard entirely —
+    # the trader explicitly opted out of the "abort if price moves
+    # past this line before any fill" check. The block then runs
+    # until the broker fills (or doesn't) and SL/TP do their job.
+    cancel_price: float | None = None
 
     rungs: list[PlanRung] = field(default_factory=list)
 
@@ -117,21 +121,25 @@ def build_plan(
     zero_price: float,
     hundred_price: float,
     base_risk_usd: float,
-    cancel_price: float,
+    cancel_price: float | None = None,
     symbol_spec: SymbolSpec,
     risk_multiplier: float = DEFAULT_RISK_MULTIPLIER,
     lot_rounding: str = "up",
     note: str | None = None,
 ) -> BlockPlan:
-    """Construct a :class:`BlockPlan` from the five trader inputs.
+    """Construct a :class:`BlockPlan` from the trader inputs.
 
     Validations are done up-front so the FSM can show the error
     before any order leaves the bot. We delegate the heavy lifting
     to :mod:`fib` and :mod:`risk` — this function only orchestrates
     them and packages the result.
 
-    The resulting plan obeys the orientation invariants the engine
-    will later double-check before placing orders:
+    ``cancel_price`` is optional. ``None`` means the trader has
+    opted out of the price-guard step entirely; the resulting
+    block will not be invalidated on a 0%-line breakout and will
+    run until fills / SL / TP / manual cancel. Pass a positive
+    number to enable the guard, in which case the orientation
+    invariants hold:
 
     * BUY block: entries descend, cancel price is *above* every entry.
     * SELL block: entries ascend, cancel price is *below* every entry.
@@ -140,11 +148,14 @@ def build_plan(
         raise ValueError(
             f"base_risk_usd must be positive, got {base_risk_usd}"
         )
-    if cancel_price <= 0:
+    if cancel_price is not None and cancel_price <= 0:
         raise ValueError(f"cancel_price must be positive, got {cancel_price}")
 
     levels = compute_levels(zero_price, hundred_price)
-    _validate_orientation(side, levels, cancel_price)
+    # Orientation validation only applies when the guard is active;
+    # the trader explicitly opted out otherwise.
+    if cancel_price is not None:
+        _validate_orientation(side, levels, cancel_price)
 
     sizings = size_rungs(
         symbol=symbol_spec,

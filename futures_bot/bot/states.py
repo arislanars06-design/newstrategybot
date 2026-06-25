@@ -14,10 +14,16 @@ from aiogram.fsm.state import State, StatesGroup
 class NewBlockFSM(StatesGroup):
     """Step-by-step prompts for ``/newblock``.
 
-    Order matches the natural human reading of a block plan: pick the
-    instrument and direction first, then the price anchors, then the
-    risk knob, then the safety cancel. Confirm is a yes/no on the
-    rendered plan.
+    Order matches the natural human reading of a block plan: pick
+    the instrument and direction first, then the price anchors,
+    then the risk knob, then confirm.
+
+    Note: the ``CANCEL_PRICE`` state was removed in the
+    auto-cancel-disabled refactor — the bot now skips the cancel-
+    price prompt entirely. The state symbol itself is kept as an
+    alias of ``CONFIRM`` so old persisted FSM contexts (cached in
+    aiogram MemoryStorage) don't crash on resume; new flows never
+    visit it.
     """
 
     SYMBOL = State()
@@ -25,5 +31,4 @@ class NewBlockFSM(StatesGroup):
     ZERO_PRICE = State()
     HUNDRED_PRICE = State()
     BASE_RISK = State()
-    CANCEL_PRICE = State()
     CONFIRM = State()

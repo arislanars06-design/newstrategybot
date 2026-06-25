@@ -137,9 +137,21 @@ class BlockEngine:
                 zero_price=plan.zero_price,
                 hundred_price=plan.hundred_price,
                 base_risk_usd=plan.base_risk_usd,
-                cancel_price=plan.cancel_price,
+                # Store ``zero_price`` as a placeholder when the
+                # trader opted out of the cancel-price guard. The
+                # column is NOT NULL in the DB; we'd add a schema
+                # migration to make it nullable, but the engine
+                # respects ``cancel_price_active`` as the on/off
+                # switch so a placeholder value is harmless.
+                cancel_price=(
+                    plan.cancel_price
+                    if plan.cancel_price is not None
+                    else plan.zero_price
+                ),
                 sl_distance=plan.sl_distance,
-                cancel_price_active=True,
+                # The guard starts active only when the trader chose
+                # a cancel price; otherwise it's off from creation.
+                cancel_price_active=plan.cancel_price is not None,
                 chat_id=chat_id,
                 note=plan.note,
             )

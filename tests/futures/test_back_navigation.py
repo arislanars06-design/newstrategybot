@@ -46,7 +46,6 @@ class TestPreviousStateTable:
             NewBlockFSM.ZERO_PRICE,
             NewBlockFSM.HUNDRED_PRICE,
             NewBlockFSM.BASE_RISK,
-            NewBlockFSM.CANCEL_PRICE,
             NewBlockFSM.CONFIRM,
         ]
         for s in states_with_back:
@@ -62,8 +61,9 @@ class TestPreviousStateTable:
             (NewBlockFSM.ZERO_PRICE,    NewBlockFSM.SIDE),
             (NewBlockFSM.HUNDRED_PRICE, NewBlockFSM.ZERO_PRICE),
             (NewBlockFSM.BASE_RISK,     NewBlockFSM.HUNDRED_PRICE),
-            (NewBlockFSM.CANCEL_PRICE,  NewBlockFSM.BASE_RISK),
-            (NewBlockFSM.CONFIRM,       NewBlockFSM.CANCEL_PRICE),
+            # CANCEL_PRICE step was removed — confirm rewinds direct
+            # to BASE_RISK so the trader can re-edit the risk knob.
+            (NewBlockFSM.CONFIRM,       NewBlockFSM.BASE_RISK),
         ],
     )
     def test_back_link_goes_to_immediate_predecessor(self, current, expected_prev):

@@ -87,6 +87,19 @@ def _signed(amount: float, places: int = 2) -> str:
     return f"{sign}{round(amount, places)}"
 
 
+def _cancel_price_label(cancel_price: float | None) -> str:
+    """Render the cancel-price field for the plan preview.
+
+    ``None`` means the trader opted out of the cancel-price guard
+    (the FSM step that asked for this was removed); we surface
+    ``не используется`` so it's clear the line is intentional, not
+    a missing-data bug.
+    """
+    if cancel_price is None:
+        return "не используется"
+    return str(cancel_price)
+
+
 def _block_trade_counter(block: Block) -> str:
     """Compact closed/total summary with per-state breakdown."""
     counts: dict[str, int] = {}
@@ -122,7 +135,7 @@ def format_plan_preview(plan: BlockPlan, *, typical_spread: float) -> str:
         f"SL-шаг: <code>{round(plan.sl_distance, 5)}</code> "
         f"(12.73% × диапазон)",
         f"Базовый риск: <code>${plan.base_risk_usd}</code>  "
-        f"Цена отмены: <code>{plan.cancel_price}</code>",
+        f"Цена отмены: <code>{_cancel_price_label(plan.cancel_price)}</code>",
         f"Тип. спред: <code>{round(typical_spread, 5)}</code>",
         "",
         "<pre>",
@@ -173,7 +186,11 @@ def format_block_summary(block: Block) -> str:
     counter_line = f"   📊 {_block_trade_counter(block)}"
     if realised != 0.0:
         counter_line += f"  💵 <b>{_signed(realised, 4)}</b>"
-    cancel_line = f"   ✋ отмена: <code>{block.cancel_price}</code>"
+    cancel_line = (
+        f"   ✋ отмена: <code>{block.cancel_price}</code>"
+        if block.cancel_price_active
+        else "   ✋ отмена: <code>выкл</code>"
+    )
     return "\n".join([head, time_line, counter_line, cancel_line])
 
 
@@ -198,7 +215,12 @@ def format_block_detail(block: Block) -> str:
         f"<code>{block.hundred_price}</code>",
     ]
     cp_state = "активна" if block.cancel_price_active else "выкл"
-    lines.append(f"Цена отмены: <code>{block.cancel_price}</code> ({cp_state})")
+    if block.cancel_price_active:
+        lines.append(
+            f"Цена отмены: <code>{block.cancel_price}</code> ({cp_state})"
+        )
+    else:
+        lines.append(f"Цена отмены: <code>не используется</code>")
     if block.note:
         lines.append(f"Заметка: <i>{_h(block.note)}</i>")
 

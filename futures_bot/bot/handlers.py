@@ -413,7 +413,7 @@ async def cmd_newblock(
     await state.clear()
     await state.set_state(NewBlockFSM.SYMBOL)
     await message.answer(
-        "Шаг 1/6 — выберите инструмент:\n\n"
+        "Шаг 1/5 — выберите инструмент:\n\n"
         f"<i>{INSTRUMENT_PICKER_LEGEND}</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=instrument_picker_keyboard(settings.quick_symbols_list),
@@ -520,7 +520,7 @@ async def _resolve_symbol_and_advance(
         confirmation = f"✅ Выбран: <code>{resolved}</code>"
 
     await message.answer(
-        f"{confirmation}\n\nШаг 2/6 — выберите сторону:",
+        f"{confirmation}\n\nШаг 2/5 — выберите сторону:",
         parse_mode=ParseMode.HTML,
         reply_markup=side_keyboard(),
     )
@@ -568,7 +568,7 @@ async def _prompt_zero_price(
         logger.debug("tick fetch failed for {sym}; skipping hint", sym=symbol)
 
     await target.answer(
-        "Шаг 3/6 — отправьте цену <b>0%</b> якоря.\n"
+        "Шаг 3/5 — отправьте цену <b>0%</b> якоря.\n"
         "Для BUY это <b>верх</b> диапазона; для SELL — <b>низ</b>."
         + hint,
         parse_mode=ParseMode.HTML,
@@ -579,7 +579,7 @@ async def _prompt_zero_price(
 async def _prompt_hundred_price(target: Message) -> None:
     """Step 4/6 — 100% anchor prompt."""
     await target.answer(
-        "Шаг 4/6 — отправьте цену <b>100%</b> якоря "
+        "Шаг 4/5 — отправьте цену <b>100%</b> якоря "
         "(противоположный конец диапазона).",
         parse_mode=ParseMode.HTML,
         reply_markup=back_only_keyboard(),
@@ -587,23 +587,11 @@ async def _prompt_hundred_price(target: Message) -> None:
 
 
 async def _prompt_base_risk(target: Message) -> None:
-    """Step 5/6 — base risk prompt."""
+    """Step 5/5 — base risk prompt (final FSM input)."""
     await target.answer(
-        "Шаг 5/6 — <b>базовый риск</b> в USD на 1-й ордер.\n"
+        "Шаг 5/5 — <b>базовый риск</b> в USD на 1-й ордер.\n"
         "Остальные ордера получат 1.5×, 2.25×, 3.375×, 5.06×, 7.59× "
         "от этой суммы.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=back_only_keyboard(),
-    )
-
-
-async def _prompt_cancel_price(target: Message) -> None:
-    """Step 6/6 — cancel price prompt."""
-    await target.answer(
-        "Шаг 6/6 — <b>цена отмены</b>.\n"
-        "Если рынок достигнет её до первого срабатывания — все "
-        "ордера будут отменены, блок станет INVALID.\n\n"
-        "Для BUY: <i>выше</i> 0% якоря. Для SELL: <i>ниже</i>.",
         parse_mode=ParseMode.HTML,
         reply_markup=back_only_keyboard(),
     )
@@ -662,7 +650,20 @@ async def fsm_hundred_price(message: Message, state: FSMContext) -> None:
 
 
 @router.message(NewBlockFSM.BASE_RISK, F.text)
-async def fsm_base_risk(message: Message, state: FSMContext) -> None:
+async def fsm_base_risk(
+    message: Message,
+    state: FSMContext,
+    adapter: BrokerAdapter,
+) -> None:
+    """Capture base risk and build the plan in one shot.
+
+    Used to be the launchpad to a separate CANCEL_PRICE prompt; the
+    trader explicitly opted out of that step, so we now skip it
+    entirely and build the plan with ``cancel_price=None``. The
+    resulting block has its cancel-price guard disabled from
+    creation — :class:`BlockEngine` respects ``cancel_price_active``
+    and never tries to evaluate the (placeholder) cancel price.
+    """
     risk = _parse_float(message.text)
     if risk is None or risk <= 0:
         await message.answer(
@@ -671,40 +672,25 @@ async def fsm_base_risk(message: Message, state: FSMContext) -> None:
         )
         return
     await state.update_data(base_risk=risk)
-    await state.set_state(NewBlockFSM.CANCEL_PRICE)
-    await _prompt_cancel_price(message)
-
-
-@router.message(NewBlockFSM.CANCEL_PRICE, F.text)
-async def fsm_cancel_price(
-    message: Message,
-    state: FSMContext,
-    adapter: BrokerAdapter,
-) -> None:
-    cancel = _parse_float(message.text)
-    if cancel is None or cancel <= 0:
-        await message.answer(
-            "Отправьте одно положительное число.",
-            reply_markup=back_only_keyboard(),
-        )
-        return
 
     data = await state.get_data()
     symbol: str = data["symbol"]
     side = BlockSide(data["side"])
     zero_price: float = data["zero_price"]
     hundred_price: float = data["hundred_price"]
-    base_risk: float = data["base_risk"]
+    base_risk: float = risk
 
     # Pull live broker spec + spread so we can size the lot correctly
-    # and validate the range against the live spread before the trader
-    # confirms.
+    # and surface a realistic spread in the preview before the
+    # trader confirms.
     try:
         info = await adapter.get_symbol_info(symbol)
         tick = await adapter.get_tick(symbol)
     except Exception as exc:  # noqa: BLE001
         logger.exception("symbol/tick fetch failed")
-        await _reply_plain(message, f"❌ Не удалось получить данные по {symbol}: {exc}")
+        await _reply_plain(
+            message, f"❌ Не удалось получить данные по {symbol}: {exc}"
+        )
         await state.clear()
         return
 
@@ -717,8 +703,6 @@ async def fsm_cancel_price(
         volume_step=info.volume_step,
     )
 
-    # Build the plan — this also validates anchor orientation and
-    # cancel-price side relative to the ladder.
     try:
         plan = build_plan(
             symbol=symbol,
@@ -726,7 +710,10 @@ async def fsm_cancel_price(
             zero_price=zero_price,
             hundred_price=hundred_price,
             base_risk_usd=base_risk,
-            cancel_price=cancel,
+            # Cancel-price guard is disabled by design — the FSM
+            # no longer collects this input. The block will run
+            # until fills / SL / TP / manual cancel.
+            cancel_price=None,
             symbol_spec=symbol_spec,
             lot_rounding="up",
         )
@@ -735,9 +722,7 @@ async def fsm_cancel_price(
         await state.clear()
         return
 
-    # Stash the plan so the confirm step can recover it cheaply. We
-    # serialise just enough to reconstruct it; the full dataclass
-    # would not survive FSM JSON storage.
+    # Stash the plan so the confirm step can rebuild it cheaply.
     await state.update_data(
         plan_payload={
             "symbol": plan.symbol,
@@ -745,7 +730,7 @@ async def fsm_cancel_price(
             "zero_price": plan.zero_price,
             "hundred_price": plan.hundred_price,
             "base_risk_usd": plan.base_risk_usd,
-            "cancel_price": plan.cancel_price,
+            "cancel_price": plan.cancel_price,    # None — placeholder
             "lot_rounding": "up",
         }
     )
@@ -778,8 +763,9 @@ _PREVIOUS_STATE: dict[str, str] = {
     NewBlockFSM.ZERO_PRICE.state:    NewBlockFSM.SIDE.state,
     NewBlockFSM.HUNDRED_PRICE.state: NewBlockFSM.ZERO_PRICE.state,
     NewBlockFSM.BASE_RISK.state:     NewBlockFSM.HUNDRED_PRICE.state,
-    NewBlockFSM.CANCEL_PRICE.state:  NewBlockFSM.BASE_RISK.state,
-    NewBlockFSM.CONFIRM.state:       NewBlockFSM.CANCEL_PRICE.state,
+    # The CANCEL_PRICE step was removed — CONFIRM rewinds straight
+    # back to BASE_RISK so the trader can adjust the risk knob.
+    NewBlockFSM.CONFIRM.state:       NewBlockFSM.BASE_RISK.state,
 }
 
 
@@ -820,14 +806,14 @@ async def fsm_back(
     msg = query.message
     if previous == NewBlockFSM.SYMBOL.state:
         await msg.answer(
-            "Шаг 1/6 — выберите инструмент:\n\n"
+            "Шаг 1/5 — выберите инструмент:\n\n"
             f"<i>{INSTRUMENT_PICKER_LEGEND}</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=instrument_picker_keyboard(settings.quick_symbols_list),
         )
     elif previous == NewBlockFSM.SIDE.state:
         await msg.answer(
-            "Шаг 2/6 — выберите сторону:",
+            "Шаг 2/5 — выберите сторону:",
             reply_markup=side_keyboard(),
         )
     elif previous == NewBlockFSM.ZERO_PRICE.state:
@@ -836,8 +822,6 @@ async def fsm_back(
         await _prompt_hundred_price(msg)
     elif previous == NewBlockFSM.BASE_RISK.state:
         await _prompt_base_risk(msg)
-    elif previous == NewBlockFSM.CANCEL_PRICE.state:
-        await _prompt_cancel_price(msg)
 
 
 @router.callback_query(NewBlockFSM.CONFIRM, F.data == CB_CONFIRM)
