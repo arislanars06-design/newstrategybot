@@ -123,6 +123,8 @@ def build_plan(
     base_risk_usd: float,
     cancel_price: float | None = None,
     symbol_spec: SymbolSpec,
+    typical_spread: float = 0.0,
+    sl_spread_safety: float = 1.5,
     risk_multiplier: float = DEFAULT_RISK_MULTIPLIER,
     lot_rounding: str = "up",
     note: str | None = None,
@@ -143,6 +145,16 @@ def build_plan(
 
     * BUY block: entries descend, cancel price is *above* every entry.
     * SELL block: entries ascend, cancel price is *below* every entry.
+
+    ``typical_spread`` and ``sl_spread_safety`` together drive the
+    *effective* SL distance the lot sizer plans against. The engine
+    pushes each rung's SL ``sl_spread_safety × live_spread`` deeper
+    than the next-rung entry at fill time (see
+    :func:`futures_bot.strategy.tp.compute_sl_price`); without
+    surfacing that buffer to the plan, the displayed "max risk"
+    under-counts by roughly that same amount — exactly the
+    discrepancy live testing caught. Sizing with the effective SL
+    keeps the trader's base-risk input honest end-to-end.
     """
     if base_risk_usd <= 0:
         raise ValueError(
@@ -157,9 +169,17 @@ def build_plan(
     if cancel_price is not None:
         _validate_orientation(side, levels, cancel_price)
 
+    # The engine adds ``sl_spread_safety × spread`` to every rung's
+    # SL at fill time to keep the chain unbroken. We anticipate that
+    # buffer here so the lot sizer plans against the *effective* SL
+    # distance and the reported "max risk" matches what the trader
+    # will actually see if everything stops out.
+    safety_buffer = max(0.0, sl_spread_safety * typical_spread)
+    effective_sl_distance = levels.sl_distance + safety_buffer
+
     sizings = size_rungs(
         symbol=symbol_spec,
-        sl_distance=levels.sl_distance,
+        sl_distance=effective_sl_distance,
         base_risk=base_risk_usd,
         num_rungs=NUM_RUNGS,
         multiplier=risk_multiplier,
@@ -174,7 +194,12 @@ def build_plan(
         zero_price=zero_price,
         hundred_price=hundred_price,
         base_risk_usd=base_risk_usd,
-        sl_distance=levels.sl_distance,
+        # Persist the *effective* distance because that is what the
+        # engine charges against the account when an SL fires. The
+        # per-rung ``sl`` price still points at the next-entry level
+        # (set by ``_assemble_rungs``) — that's the chain target the
+        # engine adjusts later with the *live* spread.
+        sl_distance=effective_sl_distance,
         cancel_price=cancel_price,
         rungs=rungs,
         note=note,

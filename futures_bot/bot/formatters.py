@@ -381,12 +381,18 @@ def render_notification(n: Notification) -> str:  # noqa: PLR0911
     p = n.payload
 
     if n.type == NotificationType.BLOCK_CREATED:
+        # Render the cancel-price field through the shared helper so
+        # the "guard disabled" case (None) reads as a friendly phrase
+        # rather than the raw word "None" Python would produce by
+        # default in the f-string.
         return (
             f"📦 <b>БЛОК #{n.block_id}</b> создан\n"
             f"Символ: <code>{_h(str(p.get('symbol')))}</code>\n"
             f"Сторона: <b>{p.get('side')}</b>\n"
             f"Ордеров: <b>{p.get('orders')}</b>\n"
-            f"Цена отмены: <code>{p.get('cancel_price')}</code>\n"
+            f"Цена отмены: <code>"
+            f"{_cancel_price_label(p.get('cancel_price'))}"
+            f"</code>\n"
             f"Макс. риск: <b>${p.get('total_real_risk')}</b>\n"
             f"Статус: <b>ACTIVE</b>"
         )

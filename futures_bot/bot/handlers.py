@@ -62,7 +62,7 @@ from futures_bot.bot.keyboards import (
     stats_window_keyboard,
 )
 from futures_bot.bot.states import NewBlockFSM
-from futures_bot.config import Settings
+from futures_bot.config import Settings, get_settings
 from futures_bot.core.engine import BlockEngine
 from futures_bot.db import (
     BlockSide,
@@ -99,6 +99,21 @@ def _parse_float(text: str | None) -> float | None:
         return float(cleaned)
     except ValueError:
         return None
+
+
+def _safe_sl_spread_safety() -> float:
+    """Read the SL-spread-safety multiplier from Settings, defaulting safely.
+
+    The plan layer needs this value to anticipate the engine's
+    fill-time SL buffer. Pulling it via :func:`get_settings` (lazy
+    cached) keeps the handler signature short — the alternative
+    would be threading Settings through every callsite for one
+    scalar, with no real testability gain.
+    """
+    try:
+        return float(get_settings().sl_spread_safety)
+    except Exception:  # noqa: BLE001
+        return 1.5
 
 
 # ===========================================================================
@@ -715,6 +730,13 @@ async def fsm_base_risk(
             # until fills / SL / TP / manual cancel.
             cancel_price=None,
             symbol_spec=symbol_spec,
+            # Push live spread + the configured safety multiplier
+            # through so the plan sizes lots against the effective
+            # SL distance (step + safety × spread). Without this the
+            # reported max-risk number under-counts because the
+            # engine adds the safety buffer at fill time.
+            typical_spread=tick.spread,
+            sl_spread_safety=_safe_sl_spread_safety(),
             lot_rounding="up",
         )
     except ValueError as exc:
@@ -732,6 +754,11 @@ async def fsm_base_risk(
             "base_risk_usd": plan.base_risk_usd,
             "cancel_price": plan.cancel_price,    # None — placeholder
             "lot_rounding": "up",
+            # Preserve the live spread the trader saw at plan time so
+            # confirm rebuilds the same lots. Otherwise a tighter or
+            # wider spread when they tap "Подтвердить" 30 seconds
+            # later would silently move the lot sizes.
+            "typical_spread": tick.spread,
         }
     )
     await state.set_state(NewBlockFSM.CONFIRM)
@@ -869,6 +896,12 @@ async def fsm_confirm_plan(
             base_risk_usd=payload["base_risk_usd"],
             cancel_price=payload["cancel_price"],
             symbol_spec=symbol_spec,
+            # Reuse the spread captured at plan time so the lots match
+            # the preview the trader already approved; otherwise a
+            # spread change between preview and confirm would silently
+            # move the lot sizes.
+            typical_spread=float(payload.get("typical_spread") or 0.0),
+            sl_spread_safety=_safe_sl_spread_safety(),
             lot_rounding=payload.get("lot_rounding", "up"),
         )
     except ValueError as exc:
