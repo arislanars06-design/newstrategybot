@@ -49,8 +49,8 @@ from futures_bot.bot.keyboards import (
     CB_STATS_ALL,
     CB_STATS_TODAY,
     CB_SYM_CUSTOM,
-    CB_SYM_HEADER,
     CB_SYM_PICK,
+    INSTRUMENT_PICKER_LEGEND,
     back_only_keyboard,
     block_submenu_keyboard,
     cancel_block_confirm_keyboard,
@@ -413,7 +413,9 @@ async def cmd_newblock(
     await state.clear()
     await state.set_state(NewBlockFSM.SYMBOL)
     await message.answer(
-        "Шаг 1/6 — выберите инструмент:",
+        "Шаг 1/6 — выберите инструмент:\n\n"
+        f"<i>{INSTRUMENT_PICKER_LEGEND}</i>",
+        parse_mode=ParseMode.HTML,
         reply_markup=instrument_picker_keyboard(settings.quick_symbols_list),
     )
 
@@ -436,17 +438,6 @@ async def fsm_symbol_pick(
         await query.answer("Bad symbol", show_alert=True)
         return
     await _resolve_symbol_and_advance(query.message, state, adapter, requested)
-    await query.answer()
-
-
-@router.callback_query(F.data == CB_SYM_HEADER)
-async def fsm_symbol_header(query: CallbackQuery) -> None:
-    """Section-header buttons in the picker are non-interactive.
-
-    Telegram requires every InlineKeyboardButton to have a callback,
-    so we register a silent ack so a stray tap doesn't spin a loading
-    indicator forever.
-    """
     await query.answer()
 
 
@@ -829,7 +820,9 @@ async def fsm_back(
     msg = query.message
     if previous == NewBlockFSM.SYMBOL.state:
         await msg.answer(
-            "Шаг 1/6 — выберите инструмент:",
+            "Шаг 1/6 — выберите инструмент:\n\n"
+            f"<i>{INSTRUMENT_PICKER_LEGEND}</i>",
+            parse_mode=ParseMode.HTML,
             reply_markup=instrument_picker_keyboard(settings.quick_symbols_list),
         )
     elif previous == NewBlockFSM.SIDE.state:

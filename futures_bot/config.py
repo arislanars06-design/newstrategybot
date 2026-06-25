@@ -96,10 +96,24 @@ class Settings(BaseSettings):
     # ``/newblock``. The trader can always override by tapping
     # "Другой" and typing the symbol freely — useful for instruments
     # the broker exposes under a non-standard name (e.g. Exness's
-    # ``XAUUSDm`` mini contracts or ``US500.cash`` indices). Default
-    # covers the majors a discretionary FX/metals trader uses every day.
+    # ``XAUUSDm`` mini contracts or ``US500.cash`` indices).
+    #
+    # The default lists the full 29-symbol tier roster ordered by
+    # tier (A → D). Tier glyphs are added by the keyboard renderer;
+    # ``.env`` keeps just the bare names so operators can edit them
+    # without staring at emoji literals.
     quick_symbols: str = Field(
-        default="XAUUSD,EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,BTCUSD",
+        default=(
+            # Tier A (🥇 рекомендованные)
+            "XAUUSD,GBPJPY,EURJPY,GBPAUD,GBPCAD,GBPUSD,USDJPY,AUDJPY,"
+            # Tier B (🥈 хорошие)
+            "EURUSD,EURAUD,AUDUSD,USDCAD,"
+            # Tier C (🥉 с оговорками)
+            "NZDJPY,CADJPY,CHFJPY,GBPNZD,NZDUSD,USDCHF,"
+            # Tier D (⚠️ риск)
+            "EURGBP,EURCHF,EURCAD,EURNZD,GBPCHF,AUDCAD,AUDCHF,AUDNZD,"
+            "NZDCAD,NZDCHF,CADCHF"
+        ),
     )
 
     # --- Computed helpers ---

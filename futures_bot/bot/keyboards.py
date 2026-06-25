@@ -63,41 +63,6 @@ CB_SYM_PICK = "sym:pick:"        # + <symbol>
 CB_SYM_CUSTOM = "sym:custom"     # fallback — type the symbol manually
 
 
-# Mapping kept small and focused on the instruments most discretionary
-# FX/metals traders actually pick. Anything not listed falls through to
-# a generic chart emoji rather than failing — extending the table
-# costs nothing.
-_SYMBOL_EMOJI: dict[str, str] = {
-    "XAUUSD": "🥇",
-    "XAGUSD": "🥈",
-    "EURUSD": "💶",
-    "GBPUSD": "💷",
-    "USDJPY": "💴",
-    "USDCHF": "🇨🇭",
-    "USDCAD": "🇨🇦",
-    "AUDUSD": "🇦🇺",
-    "NZDUSD": "🇳🇿",
-    "BTCUSD": "₿",
-    "ETHUSD": "Ξ",
-}
-
-
-def _emoji_for(symbol: str) -> str:
-    """Pick a leading emoji for a symbol button.
-
-    Two-step lookup: exact match first, then prefix match so Exness's
-    suffixed variants (``XAUUSDm``, ``EURUSD.s``) inherit their parent
-    pair's emoji without explicit listings.
-    """
-    upper = symbol.upper()
-    if upper in _SYMBOL_EMOJI:
-        return _SYMBOL_EMOJI[upper]
-    for prefix, emoji in _SYMBOL_EMOJI.items():
-        if upper.startswith(prefix):
-            return emoji
-    return "📊"
-
-
 def side_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -234,63 +199,96 @@ def stats_window_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-# Symbol → category mapping. Used by ``instrument_picker_keyboard``
-# to group buttons under section headers. Unknown symbols (exotic
-# CFDs, broker-specific names) fall through to the "other" bucket.
-_SYMBOL_CATEGORY: dict[str, str] = {
-    # Precious metals
-    "XAUUSD": "metals", "XAGUSD": "metals",
-    "XPDUSD": "metals", "XPTUSD": "metals",
-    # Major FX (USD pairs the textbooks call "majors")
-    "EURUSD": "fx_major", "GBPUSD": "fx_major", "USDJPY": "fx_major",
-    "USDCHF": "fx_major", "USDCAD": "fx_major",
-    "AUDUSD": "fx_major", "NZDUSD": "fx_major",
-    # Cross-currency pairs (no USD leg)
-    "EURJPY": "fx_cross", "GBPJPY": "fx_cross", "EURGBP": "fx_cross",
-    "AUDJPY": "fx_cross", "CHFJPY": "fx_cross", "EURAUD": "fx_cross",
-    "EURCHF": "fx_cross", "GBPCHF": "fx_cross", "AUDCAD": "fx_cross",
-    "AUDNZD": "fx_cross", "NZDJPY": "fx_cross",
-    # Crypto
-    "BTCUSD": "crypto", "ETHUSD": "crypto", "LTCUSD": "crypto",
-    "XRPUSD": "crypto", "BCHUSD": "crypto", "DOGEUSD": "crypto",
-    # Equity indices
-    "US30": "indices", "US500": "indices", "NAS100": "indices",
-    "SPX500": "indices", "DAX40": "indices", "UK100": "indices",
-    "JPN225": "indices", "AUS200": "indices",
+# =====================================================================
+# Trading-suitability tier system
+# =====================================================================
+#
+# Symbols are scored A–D by how well they fit the bot's Fibonacci-grid
+# strategy. The score is a fixed table — it doesn't move with the
+# market — but the rationale (volatility, spread economics, regime
+# stability) is the same one the discretionary trader would apply
+# when ranking pairs by hand:
+#
+# * Tier A (🥇 Рекомендованные) — the strategy's sweet spot. Good
+#   intraday volatility, tight spreads relative to range, regimes
+#   that respect technical levels. Gold and the JPY/GBP majors.
+# * Tier B (🥈 Хорошие) — solid majors that work most days but lose
+#   edge during very tight ranges. Most major pairs sit here.
+# * Tier C (🥉 С оговорками) — wider spreads or thinner liquidity
+#   means the strategy needs a strong setup; backtests show net
+#   positive results only on directional days.
+# * Tier D (⚠️ Риск) — pairs we'd avoid by default. Tight ranges,
+#   pegged or semi-pegged regimes, or simply spread-to-volatility
+#   ratios that eat the edge. Listed so the trader has the option
+#   if they have a specific view, with a warning glyph attached.
+
+_TIER_A: tuple[str, ...] = (
+    "XAUUSD", "GBPJPY", "EURJPY", "GBPAUD",
+    "GBPCAD", "GBPUSD", "USDJPY", "AUDJPY",
+)
+_TIER_B: tuple[str, ...] = (
+    "EURUSD", "EURAUD", "AUDUSD", "USDCAD",
+)
+_TIER_C: tuple[str, ...] = (
+    "NZDJPY", "CADJPY", "CHFJPY", "GBPNZD", "NZDUSD", "USDCHF",
+)
+_TIER_D: tuple[str, ...] = (
+    "EURGBP", "EURCHF", "EURCAD", "EURNZD", "GBPCHF",
+    "AUDCAD", "AUDCHF", "AUDNZD", "NZDCAD", "NZDCHF", "CADCHF",
+)
+
+# Reverse lookup: symbol → tier letter. The neutral "?" key denotes
+# any symbol not in the table (Exness mini variants, crypto, indices,
+# custom CFDs) — those still appear in the picker but with a neutral
+# glyph so the trader knows there is no tier opinion attached.
+_SYMBOL_TIER: dict[str, str] = {
+    **{s: "A" for s in _TIER_A},
+    **{s: "B" for s in _TIER_B},
+    **{s: "C" for s in _TIER_C},
+    **{s: "D" for s in _TIER_D},
 }
 
-_CATEGORY_LABEL: dict[str, str] = {
-    "metals":   "🥇 Металлы",
-    "fx_major": "💱 Major FX",
-    "fx_cross": "💱 Cross FX",
-    "crypto":   "🪙 Crypto",
-    "indices":  "📈 Индексы",
-    "other":    "📊 Прочее",
+_TIER_EMOJI: dict[str, str] = {
+    "A": "🥇",
+    "B": "🥈",
+    "C": "🥉",
+    "D": "⚠️",
+    "?": "📊",
 }
 
-# Stable display order — independent of operator's ``quick_symbols``
-# order so the trader always finds gold and majors in the same place.
-_CATEGORY_ORDER: list[str] = [
-    "metals", "fx_major", "fx_cross", "crypto", "indices", "other",
-]
+# Stable sort key — A before B before C before D before unknown.
+_TIER_ORDER: dict[str, int] = {"A": 0, "B": 1, "C": 2, "D": 3, "?": 4}
 
-# Callback string for section-header buttons. No handler subscribes
-# to it; ``handlers.py`` answers with a silent ack so a stray tap
-# doesn't time out at the Telegram side.
-CB_SYM_HEADER = "sym:header"
+# Shown as a single line in the FSM prompt before the keyboard so the
+# trader knows what the emojis mean without polluting the buttons
+# themselves with text labels.
+INSTRUMENT_PICKER_LEGEND: str = (
+    "🥇 рекомендованные · 🥈 хорошие · 🥉 с оговорками · ⚠️ риск"
+)
 
 
-def _classify(symbol: str) -> str:
-    """Bucket a symbol into a category, falling through to ``other``."""
+def _tier_for(symbol: str) -> str:
+    """Tier letter for ``symbol``; '?' for anything not on the table.
+
+    Prefix fallback matches the rest of this module's behaviour:
+    Exness's ``XAUUSDm`` inherits the tier of its parent ``XAUUSD``,
+    so suffixed account variants don't all dump into the '?' bucket.
+    """
     upper = symbol.upper()
-    if upper in _SYMBOL_CATEGORY:
-        return _SYMBOL_CATEGORY[upper]
-    # Prefix fallback so Exness suffixes (XAUUSDm, EURUSD.s, etc.)
-    # inherit their parent symbol's category for free.
-    for prefix, category in _SYMBOL_CATEGORY.items():
+    if upper in _SYMBOL_TIER:
+        return _SYMBOL_TIER[upper]
+    for prefix, tier in _SYMBOL_TIER.items():
         if upper.startswith(prefix):
-            return category
-    return "other"
+            return tier
+    return "?"
+
+
+# Default list — the full 29-symbol tier roster, ordered exactly as
+# the keyboard renders them. Operators who want a tighter picker can
+# still override via ``FB_QUICK_SYMBOLS`` in ``.env``.
+DEFAULT_QUICK_SYMBOLS: tuple[str, ...] = (
+    _TIER_A + _TIER_B + _TIER_C + _TIER_D
+)
 
 
 def instrument_picker_keyboard(
@@ -298,60 +296,55 @@ def instrument_picker_keyboard(
     *,
     columns: int = 3,
 ) -> InlineKeyboardMarkup:
-    """Symbols grouped by category, with section headers + footer row.
+    """Tier-prefixed instrument picker.
 
-    Layout (top to bottom):
+    Layout invariants:
 
-    1. For each non-empty category in :data:`_CATEGORY_ORDER`, a
-       section-header row (``── 💱 Major FX ──``) followed by the
-       symbols in that bucket wrapped to ``columns``.
-    2. A trailing ``✏️ Другой / ⬅️ Назад`` row.
+    * **Tier-ordered.** Symbols are reordered by tier letter (A → ? )
+      so the strategy's recommended picks land on the top rows. Within
+      a tier the operator's :data:`Settings.quick_symbols_list` order
+      is preserved so they can still nudge "EURJPY first among Tier A"
+      from ``.env`` without touching code.
+    * **No section headers.** The legend is rendered as a single text
+      line inside the FSM prompt (see ``INSTRUMENT_PICKER_LEGEND``);
+      buttons carry the tier emoji as a prefix instead.
+    * **Footer always present.** Even with zero symbols the trader can
+      reach the custom-text path via ``✏️ Другой`` or back out via
+      ``⬅️ Назад``.
 
-    Section headers carry the :data:`CB_SYM_HEADER` callback which
-    the handler module answers as a silent no-op so accidental taps
-    don't spin a Telegram "loading" indicator. Buckets preserve the
-    order of ``symbols``, so the operator can tune within-category
-    ordering via ``quick_symbols`` in ``.env`` without touching the
-    keyboard code.
+    The ``columns`` parameter is kept for tests and for operators who
+    want a 2-wide layout on narrow displays.
     """
-    # Bucket symbols by category, preserving operator-supplied order
-    # within each bucket. Empty strings (a stray trailing comma in
-    # .env) are dropped so they don't surface as a blank button.
-    buckets: dict[str, list[str]] = {cat: [] for cat in _CATEGORY_ORDER}
-    for sym in symbols:
+    # Sort by (tier rank, original index) so unknown tier ('?') sinks
+    # to the bottom while preserving operator-supplied order inside
+    # each tier.
+    indexed: list[tuple[int, int, str]] = []
+    for idx, sym in enumerate(symbols):
         cleaned = sym.strip()
         if not cleaned:
             continue
-        buckets[_classify(cleaned)].append(cleaned)
+        tier = _tier_for(cleaned)
+        indexed.append((_TIER_ORDER[tier], idx, cleaned))
+    indexed.sort(key=lambda t: (t[0], t[1]))
 
     rows: list[list[InlineKeyboardButton]] = []
-    for category in _CATEGORY_ORDER:
-        bucket = buckets[category]
-        if not bucket:
-            continue
-        # Section header — full-width label, no real interaction.
-        rows.append([
+    row: list[InlineKeyboardButton] = []
+    for _tier_rank, _orig_idx, sym in indexed:
+        emoji = _TIER_EMOJI[_tier_for(sym)]
+        row.append(
             InlineKeyboardButton(
-                text=f"── {_CATEGORY_LABEL[category]} ──",
-                callback_data=CB_SYM_HEADER,
+                text=f"{emoji} {sym}",
+                callback_data=f"{CB_SYM_PICK}{sym}",
             )
-        ])
-        # Symbol buttons wrapped to ``columns``.
-        row: list[InlineKeyboardButton] = []
-        for sym in bucket:
-            row.append(
-                InlineKeyboardButton(
-                    text=f"{_emoji_for(sym)} {sym}",
-                    callback_data=f"{CB_SYM_PICK}{sym}",
-                )
-            )
-            if len(row) == columns:
-                rows.append(row)
-                row = []
-        if row:
+        )
+        if len(row) == columns:
             rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
 
-    # Trailing footer row — always present even when no symbols match.
+    # Trailing footer — always present even when symbols are empty so
+    # the trader can recover via custom text or escape to the menu.
     rows.append([
         InlineKeyboardButton(text="✏️ Другой", callback_data=CB_SYM_CUSTOM),
         InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU_BLOCK),

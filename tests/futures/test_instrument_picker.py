@@ -1,14 +1,15 @@
 """Unit tests for the /newblock instrument picker keyboard.
 
-The keyboard is the only piece of UI a trader is expected to see
-*every* time they open a new block, so the small invariants here
-matter:
+The keyboard is the only piece of UI a trader sees *every* time
+they open a new block, so the layout invariants matter:
 
-* Emoji fall-back per symbol (including suffix inheritance).
-* Symbols grouped into categories in a stable order.
-* Section-header rows present + ignored by handlers.
-* Callback data round-trips to the symbol literal.
-* Trailing Custom/Back row always present.
+* Each button carries the symbol's tier emoji as a prefix.
+* Tier ordering — A 🥇 first, then B 🥈, C 🥉, D ⚠️, unknown 📊 last.
+* Operator-supplied within-tier order is preserved (the operator
+  can still nudge "EURJPY before EURAUD" via ``FB_QUICK_SYMBOLS``).
+* No section-header rows — the legend lives in the FSM prompt
+  message, the keyboard is just buttons.
+* Footer ``✏️ Другой / ⬅️ Назад`` always present.
 
 These tests deliberately avoid spinning up an aiogram dispatcher.
 ``InlineKeyboardMarkup`` is a plain Pydantic model so we can read
@@ -22,96 +23,83 @@ import pytest
 from futures_bot.bot.keyboards import (
     CB_MENU_BLOCK,
     CB_SYM_CUSTOM,
-    CB_SYM_HEADER,
     CB_SYM_PICK,
-    _classify,
-    _emoji_for,
+    DEFAULT_QUICK_SYMBOLS,
+    INSTRUMENT_PICKER_LEGEND,
+    _tier_for,
     instrument_picker_keyboard,
 )
 from futures_bot.config import Settings
 
 
-# ---------------------------------------------------------------------
-# Helpers — split the keyboard into its three logical parts.
-# ---------------------------------------------------------------------
-
-def _split_rows(kb):
-    """Return (headers, symbol_rows, footer_row).
-
-    Section headers are single-button rows whose callback is
-    :data:`CB_SYM_HEADER`. Symbol rows are everything between header
-    rows. The footer is always the last row.
-    """
-    rows = kb.inline_keyboard
-    footer = rows[-1]
-    body = rows[:-1]
-    headers = [r for r in body if len(r) == 1 and r[0].callback_data == CB_SYM_HEADER]
-    symbol_rows = [
-        r for r in body
-        if not (len(r) == 1 and r[0].callback_data == CB_SYM_HEADER)
-    ]
-    return headers, symbol_rows, footer
+def _split(kb):
+    """Return ``(symbol_rows, footer_row)`` ignoring trailing footer."""
+    return kb.inline_keyboard[:-1], kb.inline_keyboard[-1]
 
 
 # ---------------------------------------------------------------------
-# Emoji resolver
+# Tier classifier
 # ---------------------------------------------------------------------
 
-class TestEmojiResolver:
-    """``_emoji_for`` is the only place where symbol names map to glyphs."""
+class TestTierResolver:
+    """``_tier_for`` is the single source of truth for tier emojis."""
 
-    @pytest.mark.parametrize("symbol,emoji", [
-        ("XAUUSD", "🥇"),
-        ("XAGUSD", "🥈"),
-        ("EURUSD", "💶"),
-        ("BTCUSD", "₿"),
+    @pytest.mark.parametrize("symbol,tier", [
+        ("XAUUSD",  "A"),
+        ("GBPJPY",  "A"),
+        ("AUDJPY",  "A"),
+        ("EURUSD",  "B"),
+        ("USDCAD",  "B"),
+        ("NZDJPY",  "C"),
+        ("USDCHF",  "C"),
+        ("EURGBP",  "D"),
+        ("CADCHF",  "D"),
     ])
-    def test_known_majors_get_their_emoji(self, symbol, emoji):
-        assert _emoji_for(symbol) == emoji
+    def test_known_symbols_get_their_tier(self, symbol, tier):
+        assert _tier_for(symbol) == tier
+
+    def test_unknown_symbol_falls_to_question_tier(self):
+        # Things not in the table (crypto, indices, custom CFDs) get
+        # a neutral '?' marker — the keyboard renders that as 📊.
+        assert _tier_for("BTCUSD") == "?"
+        assert _tier_for("NAS100") == "?"
 
     def test_lookup_is_case_insensitive(self):
-        # The picker may receive mixed-case from a custom-text input;
-        # the emoji helper should not care.
-        assert _emoji_for("xauusd") == _emoji_for("XAUUSD")
+        assert _tier_for("xauusd") == "A"
 
-    @pytest.mark.parametrize("variant", ["XAUUSDm", "XAUUSD.s", "XAUUSD_pro"])
-    def test_prefix_match_inherits_parent_emoji(self, variant):
-        # Exness / IC Markets / Pepperstone all have suffixed variants.
-        # Without the prefix fallback those would silently lose the
-        # nice emoji.
-        assert _emoji_for(variant) == "🥇"
-
-    def test_unknown_symbol_falls_back_to_chart_glyph(self):
-        # Anything we haven't mapped should still get a non-empty
-        # leading glyph so the button layout stays uniform.
-        assert _emoji_for("US500.cash") == "📊"
+    def test_suffixed_variant_inherits_parent_tier(self):
+        # Exness's mini variants must NOT silently drop to '?'.
+        assert _tier_for("XAUUSDm") == "A"
+        assert _tier_for("EURUSD.s") == "B"
+        assert _tier_for("NZDJPY.cash") == "C"
 
 
 # ---------------------------------------------------------------------
-# Category classifier
+# Default symbol set
 # ---------------------------------------------------------------------
 
-class TestClassifier:
-    """``_classify`` decides which section a symbol belongs to."""
+class TestDefaults:
+    """The default config covers the full 29-symbol tier roster."""
 
-    @pytest.mark.parametrize("symbol,category", [
-        ("XAUUSD", "metals"),
-        ("EURUSD", "fx_major"),
-        ("USDJPY", "fx_major"),
-        ("EURJPY", "fx_cross"),
-        ("BTCUSD", "crypto"),
-        ("NAS100", "indices"),
-    ])
-    def test_known_symbols_classified(self, symbol, category):
-        assert _classify(symbol) == category
+    def test_default_quick_symbols_has_exactly_29_entries(self):
+        # Locking the count here forces a deliberate decision when
+        # the tier table grows.
+        assert len(DEFAULT_QUICK_SYMBOLS) == 29
 
-    def test_unknown_falls_back_to_other(self):
-        assert _classify("FOOBAR") == "other"
+    def test_default_starts_with_tier_a(self):
+        # First symbol must be a tier-A pick so the picker leads
+        # with a recommended option.
+        first = DEFAULT_QUICK_SYMBOLS[0]
+        assert _tier_for(first) == "A"
 
-    def test_suffixed_symbols_inherit_parent_category(self):
-        # 'XAUUSDm' should be metals via prefix match.
-        assert _classify("XAUUSDm") == "metals"
-        assert _classify("EURUSDm") == "fx_major"
+    def test_settings_default_matches_default_roster(self):
+        s = Settings(
+            mt5_login=1, mt5_password="x", mt5_server="x",
+            telegram_bot_token="x", telegram_notify_chat_id=1,
+        )
+        # Order-preserving equality so an operator who reads .env
+        # gets exactly the picker layout they saw documented.
+        assert s.quick_symbols_list == list(DEFAULT_QUICK_SYMBOLS)
 
 
 # ---------------------------------------------------------------------
@@ -121,104 +109,99 @@ class TestClassifier:
 class TestInstrumentPickerKeyboard:
     """Layout invariants of :func:`instrument_picker_keyboard`."""
 
-    def test_callback_data_round_trips_to_symbol(self):
+    def test_button_carries_tier_emoji_prefix(self):
         kb = instrument_picker_keyboard(["XAUUSD"])
-        # Find the first non-header button.
-        _, symbol_rows, _ = _split_rows(kb)
-        button = symbol_rows[0][0]
-        assert button.callback_data == f"{CB_SYM_PICK}XAUUSD"
-        # And the data prefix is stable, so the handler can split safely.
-        assert button.callback_data is not None
-        assert button.callback_data.startswith(CB_SYM_PICK)
-        recovered = button.callback_data[len(CB_SYM_PICK):]
-        assert recovered == "XAUUSD"
+        rows, _ = _split(kb)
+        assert rows[0][0].text == "🥇 XAUUSD"
 
-    def test_single_category_renders_one_header(self):
-        kb = instrument_picker_keyboard(["XAUUSD", "XAGUSD"])
-        headers, symbol_rows, _ = _split_rows(kb)
-        assert len(headers) == 1                       # only metals
-        # Both metals fit in one row (2 ≤ default 3-column wrap).
-        assert sum(len(r) for r in symbol_rows) == 2
+    def test_unknown_symbol_gets_neutral_glyph(self):
+        kb = instrument_picker_keyboard(["BTCUSD"])
+        rows, _ = _split(kb)
+        assert rows[0][0].text == "📊 BTCUSD"
 
-    def test_multiple_categories_each_get_a_header(self):
+    def test_callback_carries_unmodified_symbol(self):
+        # The handler routes by the symbol literal in the payload;
+        # any tier emoji in the button TEXT must NOT bleed into the
+        # callback data.
+        kb = instrument_picker_keyboard(["XAUUSD"])
+        rows, _ = _split(kb)
+        assert rows[0][0].callback_data == f"{CB_SYM_PICK}XAUUSD"
+
+    def test_buttons_render_in_tier_order(self):
+        # Mixed input — A, D, B, C, ? — must come out A, B, C, D, ?.
         kb = instrument_picker_keyboard(
-            ["XAUUSD", "EURUSD", "BTCUSD"]
+            ["EURGBP", "EURUSD", "XAUUSD", "NZDJPY", "BTCUSD"],
+            columns=5,
         )
-        headers, _, _ = _split_rows(kb)
-        # Three distinct categories → three section headers.
-        assert len(headers) == 3
-        labels = [r[0].text for r in headers]
-        # Stable order: metals before FX before crypto.
-        assert "Металлы" in labels[0]
-        assert "Major FX" in labels[1]
-        assert "Crypto" in labels[2]
-
-    def test_category_order_is_independent_of_input_order(self):
-        # User listed crypto first, but the keyboard puts metals first.
-        kb = instrument_picker_keyboard(["BTCUSD", "XAUUSD"])
-        headers, _, _ = _split_rows(kb)
-        assert "Металлы" in headers[0][0].text
-        assert "Crypto" in headers[1][0].text
-
-    def test_within_category_order_preserves_input(self):
-        # Both major FX — should appear in the order the operator
-        # configured them.
-        kb = instrument_picker_keyboard(["USDJPY", "EURUSD", "GBPUSD"])
-        _, symbol_rows, _ = _split_rows(kb)
-        symbols_in_order = [
-            b.text.split()[-1] for r in symbol_rows for b in r
+        rows, _ = _split(kb)
+        seq = [b.callback_data for b in rows[0]]
+        # Symbol order in the row should be tier-rank ascending.
+        assert seq == [
+            f"{CB_SYM_PICK}XAUUSD",   # A
+            f"{CB_SYM_PICK}EURUSD",   # B
+            f"{CB_SYM_PICK}NZDJPY",   # C
+            f"{CB_SYM_PICK}EURGBP",   # D
+            f"{CB_SYM_PICK}BTCUSD",   # ?
         ]
-        assert symbols_in_order == ["USDJPY", "EURUSD", "GBPUSD"]
 
-    def test_grid_wraps_at_three_columns_by_default(self):
+    def test_within_tier_order_preserves_operator_input(self):
+        # Both tier-A — the operator's order survives the sort.
         kb = instrument_picker_keyboard(
-            ["EURUSD", "GBPUSD", "USDJPY", "USDCHF"]
+            ["AUDJPY", "XAUUSD", "GBPJPY"], columns=3,
         )
-        _, symbol_rows, _ = _split_rows(kb)
-        # 4 majors at 3 cols → 3 + 1.
-        assert [len(r) for r in symbol_rows] == [3, 1]
+        rows, _ = _split(kb)
+        symbols = [b.text.split(" ", 1)[1] for b in rows[0]]
+        assert symbols == ["AUDJPY", "XAUUSD", "GBPJPY"]
 
-    def test_custom_columns_count_is_respected(self):
+    def test_three_column_wrap_is_default(self):
         kb = instrument_picker_keyboard(
-            ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD"],
-            columns=2,
+            list(DEFAULT_QUICK_SYMBOLS)
         )
-        _, symbol_rows, _ = _split_rows(kb)
-        # 5 majors at 2 cols → 2 + 2 + 1.
-        assert [len(r) for r in symbol_rows] == [2, 2, 1]
+        rows, _ = _split(kb)
+        # 29 symbols / 3 cols = 9 full rows + 1 partial of 2.
+        assert [len(r) for r in rows] == [3] * 9 + [2]
 
-    def test_trailing_row_has_custom_then_back(self):
-        kb = instrument_picker_keyboard(["XAUUSD"])
-        _, _, footer = _split_rows(kb)
-        assert len(footer) == 2
-        assert footer[0].callback_data == CB_SYM_CUSTOM
-        assert footer[1].callback_data == CB_MENU_BLOCK
+    def test_custom_columns_count_respected(self):
+        kb = instrument_picker_keyboard(["XAUUSD", "EURUSD"], columns=2)
+        rows, _ = _split(kb)
+        assert [len(r) for r in rows] == [2]
 
-    def test_empty_strings_in_input_are_skipped(self):
+    def test_empty_strings_are_dropped(self):
         kb = instrument_picker_keyboard(["", "XAUUSD", "  ", "EURUSD"])
-        _, symbol_rows, _ = _split_rows(kb)
-        labels = [b.text for r in symbol_rows for b in r]
+        rows, _ = _split(kb)
+        labels = [b.text for r in rows for b in r]
         assert all(label.strip() for label in labels)
-        # Two non-empty entries → exactly two symbol buttons.
-        assert sum(len(r) for r in symbol_rows) == 2
-
-    def test_unknown_symbol_lands_in_other_category(self):
-        kb = instrument_picker_keyboard(["XAUUSD", "FOOBAR"])
-        headers, _, _ = _split_rows(kb)
-        # Two categories: metals + other.
-        labels = [r[0].text for r in headers]
-        assert any("Прочее" in label for label in labels)
+        assert sum(len(r) for r in rows) == 2
 
     def test_no_symbols_still_renders_footer(self):
-        # Operator may set FB_QUICK_SYMBOLS="" to hide the picker;
-        # the keyboard must still surface Custom + Back so the
-        # trader can recover.
+        # FB_QUICK_SYMBOLS="" hides every quick-pick; the trader can
+        # still recover via Custom or back out via Назад.
         kb = instrument_picker_keyboard([])
-        headers, symbol_rows, footer = _split_rows(kb)
-        assert headers == []
-        assert symbol_rows == []
+        rows, footer = _split(kb)
+        assert rows == []
         assert footer[0].callback_data == CB_SYM_CUSTOM
         assert footer[1].callback_data == CB_MENU_BLOCK
+
+    def test_footer_is_always_last(self):
+        # Whatever the body looks like, the operator-recovery row is
+        # the final row of the keyboard.
+        kb = instrument_picker_keyboard(list(DEFAULT_QUICK_SYMBOLS))
+        last = kb.inline_keyboard[-1]
+        assert len(last) == 2
+        assert last[0].callback_data == CB_SYM_CUSTOM
+        assert last[1].callback_data == CB_MENU_BLOCK
+
+
+# ---------------------------------------------------------------------
+# Legend message
+# ---------------------------------------------------------------------
+
+class TestLegend:
+    """The legend string is rendered above the keyboard."""
+
+    def test_legend_lists_all_four_tier_emojis(self):
+        for emoji in ("🥇", "🥈", "🥉", "⚠️"):
+            assert emoji in INSTRUMENT_PICKER_LEGEND
 
 
 # ---------------------------------------------------------------------
@@ -226,7 +209,7 @@ class TestInstrumentPickerKeyboard:
 # ---------------------------------------------------------------------
 
 class TestQuickSymbolsParsing:
-    """``Settings.quick_symbols_list`` is the only consumer of .env."""
+    """``Settings.quick_symbols_list`` parses the CSV from ``.env``."""
 
     def _settings(self, value: str) -> Settings:
         return Settings(
@@ -237,16 +220,6 @@ class TestQuickSymbolsParsing:
             telegram_notify_chat_id=1,
             quick_symbols=value,
         )
-
-    def test_default_covers_the_common_majors(self):
-        s = Settings(
-            mt5_login=1, mt5_password="x", mt5_server="x",
-            telegram_bot_token="x", telegram_notify_chat_id=1,
-        )
-        defaults = s.quick_symbols_list
-        assert "XAUUSD" in defaults
-        assert "EURUSD" in defaults
-        assert len(defaults) >= 5
 
     def test_csv_is_split_and_trimmed(self):
         s = self._settings(" XAUUSD , EURUSD,GBPUSD ")
