@@ -253,6 +253,72 @@ class TestSingleRungWin:
         assert NotificationType.BLOCK_WIN in types
 
 
+class TestFullChainLoss:
+    """All 6 rungs fill, all 6 SL out → BLOCK_LOSS.
+
+    The user's live block #4 walked this exact path and produced
+    the expected 🔴 BLOCK LOSS message. This test pins the path so
+    a refactor of the engine's exit logic can't silently break it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_chain_of_sl_hits_marks_block_loss(
+        self, engine_and_events, xau_spec
+    ) -> None:
+        engine, events, broker = engine_and_events
+
+        # Seed an above-entries tick so the broker has a baseline.
+        await broker.feed_tick(
+            Tick(symbol="XAUUSD", bid=2640.30, ask=2640.50, time=_utcnow())
+        )
+        plan = _make_xauusd_plan(xau_spec)
+        block = await engine.create_block(plan, chat_id=42)
+
+        # Drive the tick price down past every rung's entry in turn,
+        # letting the engine see each fill on its own ``on_tick``.
+        sorted_rungs = sorted(plan.rungs, key=lambda r: r.seq)
+        last_rung = sorted_rungs[-1]
+        for rung in sorted_rungs:
+            fill_tick = Tick(
+                symbol="XAUUSD",
+                bid=rung.entry - 0.30,
+                ask=rung.entry,
+                time=_utcnow(),
+            )
+            await broker.feed_tick(fill_tick)
+            await engine.on_tick(fill_tick)
+
+        # Drop price well below the last rung's SL so every open
+        # position closes at its (chained) SL.
+        kill_tick = Tick(
+            symbol="XAUUSD",
+            bid=last_rung.sl - 5.0,
+            ask=last_rung.sl - 4.5,
+            time=_utcnow(),
+        )
+        await broker.feed_tick(kill_tick)
+        await engine.on_tick(kill_tick)
+
+        async with session_scope() as session:
+            fresh = await repository.get_block(session, block.id)
+
+        # Engine: block marked LOSS, every order in SL_HIT, net PnL
+        # negative.
+        assert fresh.status == BlockStatus.LOSS
+        assert fresh.net_pnl is not None and fresh.net_pnl < 0
+        sl_count = sum(1 for o in fresh.orders if o.state == OrderState.SL_HIT)
+        assert sl_count == 6, f"expected 6 SL_HIT orders, got {sl_count}"
+
+        # Notification: BLOCK_LOSS emitted exactly once, addressed
+        # to the block's chat, carrying the net PnL payload.
+        loss_events = [
+            n for n in events if n.type == NotificationType.BLOCK_LOSS
+        ]
+        assert len(loss_events) == 1
+        assert loss_events[0].chat_id == 42
+        assert loss_events[0].payload.get("net_pnl") is not None
+
+
 class TestManualClose:
     """/cancel from Telegram closes pending + open positions."""
 
