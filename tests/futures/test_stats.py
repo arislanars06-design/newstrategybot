@@ -175,6 +175,62 @@ class TestComputeStats:
         assert stats.by_symbol_top[1][1] == 1
 
 
+class TestComputeStatsWindow:
+    """``days=N`` filters all closed-block counters to within the window.
+
+    The window picker (Сегодня / 7д / 30д / 3мес / 6мес / 1г / Все)
+    is the trader's primary way of slicing the history, so every
+    window has to play by the same rules.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_time_is_the_default(self, db) -> None:
+        now = _utcnow()
+        await _add_block(
+            status=BlockStatus.WIN, net_pnl=10.0,
+            closed_at=now - timedelta(days=365),
+        )
+        async with session_scope() as session:
+            stats = await repository.compute_stats(session, now=now)
+        # No window → that 1-year-old win counts.
+        assert stats.window_days is None
+        assert stats.total_closed == 1
+        assert stats.total_pnl == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
+    async def test_today_window_excludes_older_blocks(self, db) -> None:
+        now = _utcnow()
+        await _add_block(
+            status=BlockStatus.WIN, net_pnl=10.0,
+            closed_at=now - timedelta(hours=2),         # in window
+        )
+        await _add_block(
+            status=BlockStatus.LOSS, net_pnl=-5.0,
+            closed_at=now - timedelta(days=2),          # out of window
+        )
+        async with session_scope() as session:
+            stats = await repository.compute_stats(session, now=now, days=1)
+        assert stats.window_days == 1
+        assert stats.wins == 1
+        assert stats.losses == 0
+        assert stats.total_pnl == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
+    async def test_window_records_in_summary(self, db) -> None:
+        async with session_scope() as session:
+            stats = await repository.compute_stats(session, days=30)
+        assert stats.window_days == 30
+
+    @pytest.mark.asyncio
+    async def test_active_count_is_not_filtered_by_window(self, db) -> None:
+        # Active blocks are instantaneous — filtering them by the
+        # window would make the screen lie about the live state.
+        await _add_block(status=BlockStatus.ACTIVE)
+        async with session_scope() as session:
+            stats = await repository.compute_stats(session, days=1)
+        assert stats.active == 1
+
+
 # ---------------------------------------------------------------------
 # format_stats
 # ---------------------------------------------------------------------

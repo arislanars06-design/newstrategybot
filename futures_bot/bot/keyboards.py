@@ -21,6 +21,13 @@ CB_SIDE_SELL = "side:sell"
 CB_CONFIRM = "confirm:yes"
 CB_CANCEL = "confirm:no"
 
+# --- FSM navigation ---
+# Single ⬅️ Назад callback shared by every step that has a Back
+# button: side keyboard, every text-input prompt, and the confirm
+# screen. The handler reads the current FSM state and rewinds one
+# step using a state → predecessor table.
+CB_FSM_BACK = "fsm:back"
+
 # --- main menu ---
 CB_MENU_BLOCK = "menu:block"
 CB_MENU_STATS = "menu:stats"
@@ -35,6 +42,17 @@ CB_BLOCK_CANCEL = "block:cancel"
 # --- /cancel picker / confirm flow ---
 CB_CANCEL_BLOCK_PICK = "cb:pick:"        # + <block_id>
 CB_CANCEL_BLOCK_CONFIRM = "cb:confirm:"  # + <block_id>
+
+# --- stats time-range callbacks (days; "0" means all-time) ---
+# Mirrors the crypto bot's window picker so the muscle memory the
+# trader has built around /stats carries over 1:1.
+CB_STATS_TODAY = "stats:1"
+CB_STATS_7D = "stats:7"
+CB_STATS_30D = "stats:30"
+CB_STATS_3MO = "stats:90"
+CB_STATS_6MO = "stats:180"
+CB_STATS_1Y = "stats:365"
+CB_STATS_ALL = "stats:0"
 
 # --- /newblock instrument picker ---
 # Symbol callback keeps the symbol literal in the data payload — at
@@ -86,19 +104,46 @@ def side_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🟢 BUY (лонг)", callback_data=CB_SIDE_BUY),
                 InlineKeyboardButton(text="🔴 SELL (шорт)", callback_data=CB_SIDE_SELL),
-            ]
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_FSM_BACK),
+            ],
         ]
     )
 
 
 def confirm_keyboard() -> InlineKeyboardMarkup:
+    """Final-step confirm.
+
+    Three buttons: confirm commits the plan to the broker, back returns
+    to the previous (cancel-price) step so the trader can adjust, and
+    cancel clears the FSM entirely.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Подтвердить", callback_data=CB_CONFIRM),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_FSM_BACK),
                 InlineKeyboardButton(text="❌ Отмена", callback_data=CB_CANCEL),
-            ]
+            ],
         ]
+    )
+
+
+def back_only_keyboard() -> InlineKeyboardMarkup:
+    """Tiny one-button keyboard attached to every text-input prompt.
+
+    Lets the trader rewind one step without leaving the FSM. Picked
+    over a reply keyboard because reply keyboards persist between
+    messages and would mask other UI; an inline button right under
+    the prompt is the more disposable surface.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_FSM_BACK),
+        ]]
     )
 
 
@@ -156,6 +201,36 @@ def cancel_block_confirm_keyboard(block_id: int) -> InlineKeyboardMarkup:
             ),
             InlineKeyboardButton(text="❌ Отмена", callback_data=CB_BLOCK_CANCEL),
         ]]
+    )
+
+
+def stats_window_keyboard() -> InlineKeyboardMarkup:
+    """Time-window picker for the 📊 Статистика screen.
+
+    Layout mirrors the crypto bot: short windows on the first row,
+    medium on the second, ``All`` and ``Back`` on the third. Each
+    button carries its window size as a callback suffix so a single
+    handler can serve them all.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Сегодня", callback_data=CB_STATS_TODAY),
+                InlineKeyboardButton(text="7д", callback_data=CB_STATS_7D),
+                InlineKeyboardButton(text="30д", callback_data=CB_STATS_30D),
+            ],
+            [
+                InlineKeyboardButton(text="3мес", callback_data=CB_STATS_3MO),
+                InlineKeyboardButton(text="6мес", callback_data=CB_STATS_6MO),
+                InlineKeyboardButton(text="1г", callback_data=CB_STATS_1Y),
+            ],
+            [
+                InlineKeyboardButton(text="Все", callback_data=CB_STATS_ALL),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU_BACK),
+            ],
+        ]
     )
 
 

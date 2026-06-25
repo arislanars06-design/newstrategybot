@@ -34,15 +34,24 @@ from futures_bot.bot.keyboards import (
     CB_CANCEL_BLOCK_CONFIRM,
     CB_CANCEL_BLOCK_PICK,
     CB_CONFIRM,
+    CB_FSM_BACK,
     CB_MENU_BACK,
     CB_MENU_BALANCE,
     CB_MENU_BLOCK,
     CB_MENU_STATS,
     CB_SIDE_BUY,
     CB_SIDE_SELL,
+    CB_STATS_1Y,
+    CB_STATS_30D,
+    CB_STATS_3MO,
+    CB_STATS_6MO,
+    CB_STATS_7D,
+    CB_STATS_ALL,
+    CB_STATS_TODAY,
     CB_SYM_CUSTOM,
     CB_SYM_HEADER,
     CB_SYM_PICK,
+    back_only_keyboard,
     block_submenu_keyboard,
     cancel_block_confirm_keyboard,
     cancel_block_picker_keyboard,
@@ -50,6 +59,7 @@ from futures_bot.bot.keyboards import (
     instrument_picker_keyboard,
     main_menu_keyboard,
     side_keyboard,
+    stats_window_keyboard,
 )
 from futures_bot.bot.states import NewBlockFSM
 from futures_bot.config import Settings
@@ -320,24 +330,60 @@ async def menu_balance(query: CallbackQuery, adapter: BrokerAdapter) -> None:
 
 @router.callback_query(F.data == CB_MENU_STATS)
 async def menu_stats(query: CallbackQuery) -> None:
-    """Render aggregated block stats from the DB."""
+    """Open the stats window picker (Сегодня / 7д / 30д / …)."""
     await query.answer()
     if query.message is None:
         return
+    await query.message.answer(
+        "📊 <b>Статистика</b> — выберите период:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=stats_window_keyboard(),
+    )
+
+
+# Single callback handler for every window — the chosen days count
+# lives in the callback payload (e.g. ``stats:7``).
+@router.callback_query(F.data.in_({
+    CB_STATS_TODAY,
+    CB_STATS_7D,
+    CB_STATS_30D,
+    CB_STATS_3MO,
+    CB_STATS_6MO,
+    CB_STATS_1Y,
+    CB_STATS_ALL,
+}))
+async def stats_window(query: CallbackQuery) -> None:
+    """Render stats for the chosen window."""
+    await query.answer()
+    if query.message is None or query.data is None:
+        return
+    try:
+        days_int = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return
+    # ``0`` is the magic "all-time" value baked into the callback
+    # strings so they fit the same ``stats:<int>`` shape.
+    days = days_int if days_int > 0 else None
     async with session_scope() as session:
-        stats = await repository.compute_stats(session)
+        stats = await repository.compute_stats(session, days=days)
     await query.message.answer(
         format_stats(stats),
         parse_mode=ParseMode.HTML,
+        reply_markup=stats_window_keyboard(),
     )
 
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
-    """Slash-command twin of the 📊 Статистика inline button."""
-    async with session_scope() as session:
-        stats = await repository.compute_stats(session)
-    await _reply_html(message, format_stats(stats))
+    """Slash-command twin: opens the same window picker as the inline button."""
+    await _reply_html(
+        message,
+        "📊 <b>Статистика</b> — выберите период:",
+    )
+    await message.answer(
+        "Выберите окно ниже:",
+        reply_markup=stats_window_keyboard(),
+    )
 
 
 # ===========================================================================
@@ -498,10 +544,25 @@ async def fsm_side(
     side = BlockSide.BUY if query.data == CB_SIDE_BUY else BlockSide.SELL
     await state.update_data(side=str(side))
     await state.set_state(NewBlockFSM.ZERO_PRICE)
+    msg = query.message
+    if msg is not None:
+        await _prompt_zero_price(msg, state, adapter)
+    await query.answer()
 
-    # Fetch the live tick so the 0% prompt can include the current
-    # ask/bid as a reference. Failure is silent — the prompt still
-    # works, just without the hint, and the trader can keep typing.
+
+# ---------------------------------------------------------------------
+# Per-state prompt helpers (used by forward FSM and the ⬅️ Назад path)
+# ---------------------------------------------------------------------
+#
+# Centralising the prompts here means the ⬅️ Назад handler can rewind
+# state and re-render the previous step's prompt without duplicating
+# the prompt text in two places. Each helper takes the target message
+# to answer plus whatever DI it needs to do its job.
+
+async def _prompt_zero_price(
+    target: Message, state: FSMContext, adapter: BrokerAdapter
+) -> None:
+    """Step 3/6 — 0% anchor prompt with optional current-price hint."""
     data = await state.get_data()
     symbol = str(data.get("symbol") or "")
     hint = ""
@@ -513,41 +574,72 @@ async def fsm_side(
             f"bid=<code>{tick.bid}</code>"
         )
     except Exception:  # noqa: BLE001
-        # Logged at debug — it's fine for a fresh symbol on Market
-        # Watch to not have a tick yet.
         logger.debug("tick fetch failed for {sym}; skipping hint", sym=symbol)
 
-    msg = query.message
-    if msg is not None:
-        await msg.answer(
-            "Шаг 3/6 — отправьте цену <b>0%</b> якоря.\n"
-            "Для BUY это <b>верх</b> диапазона; для SELL — <b>низ</b>."
-            + hint,
-            parse_mode=ParseMode.HTML,
-        )
-    await query.answer()
+    await target.answer(
+        "Шаг 3/6 — отправьте цену <b>0%</b> якоря.\n"
+        "Для BUY это <b>верх</b> диапазона; для SELL — <b>низ</b>."
+        + hint,
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_only_keyboard(),
+    )
+
+
+async def _prompt_hundred_price(target: Message) -> None:
+    """Step 4/6 — 100% anchor prompt."""
+    await target.answer(
+        "Шаг 4/6 — отправьте цену <b>100%</b> якоря "
+        "(противоположный конец диапазона).",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_only_keyboard(),
+    )
+
+
+async def _prompt_base_risk(target: Message) -> None:
+    """Step 5/6 — base risk prompt."""
+    await target.answer(
+        "Шаг 5/6 — <b>базовый риск</b> в USD на 1-й ордер.\n"
+        "Остальные ордера получат 1.5×, 2.25×, 3.375×, 5.06×, 7.59× "
+        "от этой суммы.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_only_keyboard(),
+    )
+
+
+async def _prompt_cancel_price(target: Message) -> None:
+    """Step 6/6 — cancel price prompt."""
+    await target.answer(
+        "Шаг 6/6 — <b>цена отмены</b>.\n"
+        "Если рынок достигнет её до первого срабатывания — все "
+        "ордера будут отменены, блок станет INVALID.\n\n"
+        "Для BUY: <i>выше</i> 0% якоря. Для SELL: <i>ниже</i>.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_only_keyboard(),
+    )
 
 
 @router.message(NewBlockFSM.ZERO_PRICE, F.text)
 async def fsm_zero_price(message: Message, state: FSMContext) -> None:
     price = _parse_float(message.text)
     if price is None or price <= 0:
-        await message.answer("Отправьте одно положительное число.")
+        await message.answer(
+            "Отправьте одно положительное число.",
+            reply_markup=back_only_keyboard(),
+        )
         return
     await state.update_data(zero_price=price)
     await state.set_state(NewBlockFSM.HUNDRED_PRICE)
-    await message.answer(
-        "Шаг 4/6 — отправьте цену <b>100%</b> якоря "
-        "(противоположный конец диапазона).",
-        parse_mode=ParseMode.HTML,
-    )
+    await _prompt_hundred_price(message)
 
 
 @router.message(NewBlockFSM.HUNDRED_PRICE, F.text)
 async def fsm_hundred_price(message: Message, state: FSMContext) -> None:
     price = _parse_float(message.text)
     if price is None or price <= 0:
-        await message.answer("Отправьте одно положительное число.")
+        await message.answer(
+            "Отправьте одно положительное число.",
+            reply_markup=back_only_keyboard(),
+        )
         return
 
     # Auto-correct orientation: if the trader entered the anchors the
@@ -567,38 +659,29 @@ async def fsm_hundred_price(message: Message, state: FSMContext) -> None:
     await state.update_data(zero_price=new_zero, hundred_price=new_hundred)
     await state.set_state(NewBlockFSM.BASE_RISK)
 
-    swap_note = ""
     if swapped:
         side_word = "выше" if side == BlockSide.BUY else "ниже"
-        swap_note = (
-            f"\n\n⚠️ <i>Якоря поменяны местами автоматически: "
+        await message.answer(
+            f"⚠️ <i>Якоря поменяны местами автоматически: "
             f"0% = {new_zero}, 100% = {new_hundred} "
-            f"(для {side} 0% должна быть {side_word}).</i>"
+            f"(для {side} 0% должна быть {side_word}).</i>",
+            parse_mode=ParseMode.HTML,
         )
-
-    await message.answer(
-        "Шаг 5/6 — <b>базовый риск</b> в USD на 1-й ордер.\n"
-        "Остальные ордера получат 1.5×, 2.25×, 3.375×, 5.06×, 7.59× "
-        "от этой суммы." + swap_note,
-        parse_mode=ParseMode.HTML,
-    )
+    await _prompt_base_risk(message)
 
 
 @router.message(NewBlockFSM.BASE_RISK, F.text)
 async def fsm_base_risk(message: Message, state: FSMContext) -> None:
     risk = _parse_float(message.text)
     if risk is None or risk <= 0:
-        await message.answer("Отправьте одно положительное число.")
+        await message.answer(
+            "Отправьте одно положительное число.",
+            reply_markup=back_only_keyboard(),
+        )
         return
     await state.update_data(base_risk=risk)
     await state.set_state(NewBlockFSM.CANCEL_PRICE)
-    await message.answer(
-        "Шаг 6/6 — <b>цена отмены</b>.\n"
-        "Если рынок достигнет её до первого срабатывания — все "
-        "ордера будут отменены, блок станет INVALID.\n\n"
-        "Для BUY: <i>выше</i> 0% якоря. Для SELL: <i>ниже</i>.",
-        parse_mode=ParseMode.HTML,
-    )
+    await _prompt_cancel_price(message)
 
 
 @router.message(NewBlockFSM.CANCEL_PRICE, F.text)
@@ -609,7 +692,10 @@ async def fsm_cancel_price(
 ) -> None:
     cancel = _parse_float(message.text)
     if cancel is None or cancel <= 0:
-        await message.answer("Отправьте одно положительное число.")
+        await message.answer(
+            "Отправьте одно положительное число.",
+            reply_markup=back_only_keyboard(),
+        )
         return
 
     data = await state.get_data()
@@ -686,6 +772,79 @@ async def fsm_cancel_plan(query: CallbackQuery, state: FSMContext) -> None:
     if query.message is not None:
         await query.message.answer("План отменён.")
     await query.answer()
+
+
+# ---------------------------------------------------------------------
+# ⬅️ Назад navigation
+# ---------------------------------------------------------------------
+#
+# Maps every FSM state that has a Back button to the state it should
+# rewind to. ``None`` here means "no further back" (used by SYMBOL
+# itself — the picker keyboard's Back goes to the block submenu via
+# CB_MENU_BLOCK, handled separately).
+_PREVIOUS_STATE: dict[str, str] = {
+    NewBlockFSM.SIDE.state:          NewBlockFSM.SYMBOL.state,
+    NewBlockFSM.ZERO_PRICE.state:    NewBlockFSM.SIDE.state,
+    NewBlockFSM.HUNDRED_PRICE.state: NewBlockFSM.ZERO_PRICE.state,
+    NewBlockFSM.BASE_RISK.state:     NewBlockFSM.HUNDRED_PRICE.state,
+    NewBlockFSM.CANCEL_PRICE.state:  NewBlockFSM.BASE_RISK.state,
+    NewBlockFSM.CONFIRM.state:       NewBlockFSM.CANCEL_PRICE.state,
+}
+
+
+@router.callback_query(F.data == CB_FSM_BACK)
+async def fsm_back(
+    query: CallbackQuery,
+    state: FSMContext,
+    adapter: BrokerAdapter,
+    settings: Settings,
+) -> None:
+    """Rewind one FSM step and re-render the previous prompt.
+
+    The callback is the only generic Back button in the bot — it's
+    attached to every keyboard inside the /newblock FSM. We look up
+    the previous state via :data:`_PREVIOUS_STATE`, transition the
+    FSM, and call the same per-state prompt helpers the forward
+    handlers use so the UX is identical to landing on that step the
+    first time.
+
+    Edge cases:
+
+    * Back from SYMBOL is not handled here — the picker keyboard's
+      own Назад button goes to the block submenu and is wired to
+      CB_MENU_BLOCK, not CB_FSM_BACK.
+    * If the FSM is in an unexpected state (e.g. user kept an old
+      message around and tapped Back after the FSM was cleared), we
+      silently ack and do nothing.
+    """
+    await query.answer()
+    if query.message is None:
+        return
+    current = await state.get_state()
+    previous = _PREVIOUS_STATE.get(current or "")
+    if previous is None:
+        return
+    await state.set_state(previous)
+
+    msg = query.message
+    if previous == NewBlockFSM.SYMBOL.state:
+        await msg.answer(
+            "Шаг 1/6 — выберите инструмент:",
+            reply_markup=instrument_picker_keyboard(settings.quick_symbols_list),
+        )
+    elif previous == NewBlockFSM.SIDE.state:
+        await msg.answer(
+            "Шаг 2/6 — выберите сторону:",
+            reply_markup=side_keyboard(),
+        )
+    elif previous == NewBlockFSM.ZERO_PRICE.state:
+        await _prompt_zero_price(msg, state, adapter)
+    elif previous == NewBlockFSM.HUNDRED_PRICE.state:
+        await _prompt_hundred_price(msg)
+    elif previous == NewBlockFSM.BASE_RISK.state:
+        await _prompt_base_risk(msg)
+    elif previous == NewBlockFSM.CANCEL_PRICE.state:
+        await _prompt_cancel_price(msg)
 
 
 @router.callback_query(NewBlockFSM.CONFIRM, F.data == CB_CONFIRM)

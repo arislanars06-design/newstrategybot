@@ -253,13 +253,40 @@ def format_balance(*, balance: float, equity: float, free_margin: float) -> str:
 # Statistics
 # ============================================================================
 
+# Map a window size (in days) to its human-readable Russian label.
+# Mirrors the labels the crypto bot uses so traders see a consistent
+# vocabulary across the two bots.
+_STATS_WINDOW_LABEL: dict[int | None, str] = {
+    None: "за всё время",
+    1: "за сегодня",
+    7: "за 7 дней",
+    30: "за 30 дней",
+    90: "за 3 месяца",
+    180: "за 6 месяцев",
+    365: "за 1 год",
+}
+
+
+def _window_label(days: int | None) -> str:
+    """Look up a human label for a stats window, falling back gracefully."""
+    if days in _STATS_WINDOW_LABEL:
+        return _STATS_WINDOW_LABEL[days]
+    if days is None:
+        return "за всё время"
+    return f"за {days} дн."
+
+
 def format_stats(stats: StatsSummary) -> str:
     """Render aggregated block stats for the 📊 Статистика screen.
 
-    Empty-state path: when no blocks exist at all, return a single
-    friendly line that doubles as a CTA — keeps the chat from
-    showing a wall of zeros on first launch.
+    Two empty-state paths:
+
+    * No blocks at all → friendly CTA pointing at ``➕ Создать``.
+    * Blocks exist but none fall in the chosen window → "В этом окне
+      пусто" so the trader knows the data is real, just out of range.
     """
+    label = _window_label(stats.window_days)
+
     if stats.total == 0:
         return (
             "📊 <b>Статистика</b>\n\n"
@@ -268,13 +295,24 @@ def format_stats(stats: StatsSummary) -> str:
         )
 
     lines: list[str] = [
-        "📊 <b>Статистика</b>",
+        f"📊 <b>Статистика</b> — {label}",
         "",
-        f"Всего блоков: <b>{stats.total}</b>",
-        f"  🟡 Активные: <b>{stats.active}</b>",
+        f"🟡 Активные сейчас: <b>{stats.active}</b>",
+    ]
+
+    if stats.total_closed == 0:
+        lines.extend([
+            "",
+            "В этом окне нет закрытых блоков — выберите больший период.",
+        ])
+        return "\n".join(lines)
+
+    lines.extend([
+        "",
+        f"Закрытых блоков: <b>{stats.total_closed}</b>",
         f"  🟢 Выигрыши: <b>{stats.wins}</b>",
         f"  🔴 Убытки: <b>{stats.losses}</b>",
-    ]
+    ])
     # Only show INVALID / ERROR rows when they have content — keeps
     # the message tight for users whose blocks all reach a clean end.
     if stats.invalid:
@@ -287,16 +325,19 @@ def format_stats(stats: StatsSummary) -> str:
 
     lines.extend([
         "",
-        f"💰 Итоговый PnL: <b>{_signed(stats.total_pnl, 2)}</b> USD",
-        f"📅 PnL за 7 дней: <b>{_signed(stats.pnl_last_7d, 2)}</b> USD",
+        f"💰 PnL: <b>{_signed(stats.total_pnl, 2)}</b> USD",
     ])
+    # Cross-check the 7-day PnL only when the window is broader than
+    # a week — same number twice would just be noise.
+    if stats.window_days is None or stats.window_days > 7:
+        lines.append(
+            f"📅 PnL за 7 дней: <b>{_signed(stats.pnl_last_7d, 2)}</b> USD"
+        )
 
     if stats.by_symbol_top:
         lines.append("")
         lines.append("<b>Топ инструментов:</b>")
         for sym, count, pnl in stats.by_symbol_top:
-            # Always show the PnL — even at zero it tells the trader
-            # that the symbol was used but hasn't closed any block yet.
             lines.append(
                 f"  <code>{_h(sym)}</code> — {count} блок(а), "
                 f"PnL <b>{_signed(pnl, 2)}</b>"

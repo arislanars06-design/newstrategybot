@@ -234,6 +234,12 @@ class StatsSummary:
     formatter boundary without anyone mutating them in-flight. The
     counts are integers; PnLs are USD (or whatever currency the
     account is denominated in) rounded to two decimal places.
+
+    ``window_days`` records the window the stats were computed over
+    (None = all-time). ``total`` is always the all-time block count
+    so the formatter's empty-state path stays meaningful regardless
+    of the chosen window; ``total_closed`` is the within-window
+    terminal-block count.
     """
 
     total: int
@@ -246,12 +252,15 @@ class StatsSummary:
     win_rate: float | None     # None when no decisive (WIN/LOSS) blocks
     pnl_last_7d: float
     by_symbol_top: tuple[tuple[str, int, float], ...] = field(default_factory=tuple)
+    window_days: int | None = None
+    total_closed: int = 0
 
 
 async def compute_stats(
     session: AsyncSession,
     *,
     now: datetime | None = None,
+    days: int | None = None,
     top_symbol_limit: int = 5,
 ) -> StatsSummary:
     """Aggregate block counts and PnL into a :class:`StatsSummary`.
@@ -265,35 +274,61 @@ async def compute_stats(
     Args:
         session: open async session (read-only is fine).
         now: override "current time" for testability; defaults to UTC now.
+        days: window size for the "terminal blocks" counts. ``None``
+            means all-time; an integer N filters to blocks closed in
+            the last N days. The ``active`` count is *not* filtered —
+            active blocks are inherently current and would be hidden
+            from the trader if we did.
         top_symbol_limit: how many symbols to surface in the breakdown.
     """
     if now is None:
         now = datetime.now(tz=timezone.utc)
+    since: datetime | None = (
+        now - timedelta(days=days) if days is not None and days > 0 else None
+    )
     week_ago = now - timedelta(days=7)
 
     stmt = select(Block)
     result = await session.execute(stmt)
     blocks = list(result.scalars().all())
 
-    total = len(blocks)
+    # ``active`` is *always* an instantaneous count — it answers "what
+    # is the bot doing right now" rather than "what has happened in
+    # the window" so we never filter it by ``since``.
     active = sum(
         1 for b in blocks
         if b.status in (BlockStatus.CREATED, BlockStatus.ACTIVE)
     )
-    wins = sum(1 for b in blocks if b.status == BlockStatus.WIN)
-    losses = sum(1 for b in blocks if b.status == BlockStatus.LOSS)
-    invalid = sum(1 for b in blocks if b.status == BlockStatus.INVALID)
-    errored = sum(1 for b in blocks if b.status == BlockStatus.ERROR)
 
-    # PnL totals only count terminal blocks — active blocks have no
-    # net_pnl yet, and an in-flight unrealised number would mislead
-    # the trader at a glance.
+    def _in_window(b: Block) -> bool:
+        """Terminal blocks closed within the window (if any)."""
+        if not b.is_terminal:
+            return False
+        if since is None:
+            return True
+        if b.closed_at is None:
+            return False
+        closed = b.closed_at
+        if closed.tzinfo is None:
+            closed = closed.replace(tzinfo=timezone.utc)
+        return closed >= since
+
+    in_window = [b for b in blocks if _in_window(b)]
+
+    wins = sum(1 for b in in_window if b.status == BlockStatus.WIN)
+    losses = sum(1 for b in in_window if b.status == BlockStatus.LOSS)
+    invalid = sum(1 for b in in_window if b.status == BlockStatus.INVALID)
+    errored = sum(1 for b in in_window if b.status == BlockStatus.ERROR)
+    total_terminal = wins + losses + invalid + errored
+    # ``total`` keeps the all-time semantics so the empty-state path
+    # of the formatter ("nothing exists yet") still works regardless
+    # of the window.
+    total = len(blocks)
+
     total_pnl = 0.0
     pnl_last_7d = 0.0
-    for b in blocks:
-        if not b.is_terminal:
-            continue
-        net = b.net_pnl or 0.0
+    for b in in_window:
+        net = float(b.net_pnl or 0.0)
         total_pnl += net
         if b.closed_at is not None:
             closed_aware = b.closed_at
@@ -305,14 +340,15 @@ async def compute_stats(
     decided = wins + losses
     win_rate = (wins / decided) if decided > 0 else None
 
-    # By-symbol breakdown. Track both block count and PnL per symbol;
-    # sort by count so the most-used pair surfaces first.
+    # By-symbol breakdown over the same window. Sort by count first
+    # so the most-used pair surfaces; tiebreak on absolute PnL so a
+    # symbol with notable swings rises above a symbol with the same
+    # count but negligible PnL.
     by_symbol: dict[str, list[float]] = {}
-    for b in blocks:
+    for b in in_window:
         agg = by_symbol.setdefault(b.symbol, [0, 0.0])
         agg[0] += 1                                  # block count
-        if b.is_terminal:
-            agg[1] += float(b.net_pnl or 0.0)        # cumulative pnl
+        agg[1] += float(b.net_pnl or 0.0)            # cumulative pnl
     top = sorted(
         ((sym, int(c), float(p)) for sym, (c, p) in by_symbol.items()),
         key=lambda t: (t[1], abs(t[2])),
@@ -330,4 +366,6 @@ async def compute_stats(
         win_rate=round(win_rate, 4) if win_rate is not None else None,
         pnl_last_7d=round(pnl_last_7d, 2),
         by_symbol_top=tuple(top),
+        window_days=days,
+        total_closed=total_terminal,
     )
