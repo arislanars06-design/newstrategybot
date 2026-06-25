@@ -260,3 +260,34 @@ def estimate_loss_per_lot_at_sl(
     without importing :mod:`risk` directly.
     """
     return loss_per_lot(symbol_spec, sl_distance)
+
+
+def normalize_anchors(
+    side: BlockSide,
+    zero_price: float,
+    hundred_price: float,
+) -> tuple[float, float, bool]:
+    """Reorient anchors so they match the side's expected geometry.
+
+    Returns ``(zero, hundred, swapped)``. ``swapped`` is True when
+    the inputs were flipped to satisfy the strategy's invariant:
+
+    * BUY:  zero_price > hundred_price (entries descend into the dip)
+    * SELL: zero_price < hundred_price (entries ascend into the rally)
+
+    Equal prices and properly-ordered inputs pass through unchanged.
+    Domain validation (zero == hundred, negatives, etc.) is left to
+    :func:`_validate_orientation` so the user sees a single
+    consistent error path when the inputs are genuinely bad rather
+    than just flipped.
+
+    The Telegram FSM calls this *before* :func:`build_plan` so the
+    most common user mistake ("I typed 2640 first instead of 2660")
+    doesn't blow up the whole plan — the trader gets a helpful
+    "anchors auto-swapped" notice instead of a validation error.
+    """
+    if side == BlockSide.BUY and zero_price < hundred_price:
+        return hundred_price, zero_price, True
+    if side == BlockSide.SELL and zero_price > hundred_price:
+        return hundred_price, zero_price, True
+    return zero_price, hundred_price, False

@@ -25,6 +25,74 @@ from futures_bot.db.enums import BlockSide
 
 
 # ---------------------------------------------------------------------
+# Symbol-name resolution helper (shared by every adapter)
+# ---------------------------------------------------------------------
+
+# Suffixes the major retail MT5 brokers append to base symbol names.
+# Stored in the exact case the brokers ship them — MT5's symbol
+# lookup is case-sensitive ('EURUSDm' is a different name from
+# 'EURUSDM') so we must preserve the conventional casing.
+_BROKER_SUFFIXES: tuple[str, ...] = (
+    "m",        # Exness Standard Mini, Pepperstone Razor mini
+    ".s",       # IC Markets Standard, FP Markets Pro
+    ".r",       # raw-spread / ECN flavours
+    ".cash",    # cash-settled indices (Pepperstone, OANDA)
+    "#",        # XM and some white-label MT5
+    ".pro",     # ECN-pro variants
+    "_i",       # institutional variants
+)
+
+
+def symbol_name_candidates(requested: str) -> list[str]:
+    """All plausible broker names to try for one user-supplied symbol.
+
+    The brokers in the retail MT5 ecosystem (Exness, IC Markets,
+    Pepperstone, XM, FP Markets) expose the same instrument under
+    a small set of suffixed variants. Rather than make the trader
+    learn each broker's convention we generate every reasonable
+    candidate and let the adapter probe ``symbol_info`` in order.
+
+    Properties of the returned list:
+
+    * **Stable order.** Exact input first (lets a trader who already
+      knows the broker name short-circuit the search), then uppercase
+      base, then each suffix appended in :data:`_BROKER_SUFFIXES`
+      order — that order is the prior probability of running into
+      each broker, biggest first.
+    * **Suffix-aware stripping.** If the input already ends in a
+      known suffix (case-insensitive) we strip it before generating
+      variants, so a user who typed ``EURUSDm`` still reaches plain
+      ``EURUSD`` and the other suffixes.
+    * **De-duped.** No name appears twice even when multiple rules
+      would emit it.
+    """
+    out: list[str] = []
+
+    def push(name: str) -> None:
+        if name and name not in out:
+            out.append(name)
+
+    cleaned = requested.strip()
+    push(cleaned)                            # exactly what the user typed
+    push(cleaned.upper())                    # common lower-case input case
+
+    # Determine the bare base, stripping any known suffix the user
+    # may have included themselves.
+    upper = cleaned.upper()
+    base = upper
+    for suf in _BROKER_SUFFIXES:
+        if upper.endswith(suf.upper()):
+            base = upper[: -len(suf)]
+            break
+
+    push(base)
+    for suf in _BROKER_SUFFIXES:
+        push(f"{base}{suf}")
+
+    return out
+
+
+# ---------------------------------------------------------------------
 # DTOs (data transfer objects)
 # ---------------------------------------------------------------------
 
@@ -159,6 +227,27 @@ class BrokerAdapter(ABC):
         """Cheap health probe used by the engine before sending orders."""
 
     # ---- Market data ----
+
+    @abstractmethod
+    async def resolve_symbol(self, requested: str) -> str:
+        """Translate a user-typed symbol to the broker's actual name.
+
+        Different brokers expose the same instrument under different
+        names — Exness mini accounts append ``m``, some IC Markets
+        accounts use ``.s`` for raw spread, Pepperstone uses ``.cash``
+        for indices. Adapters try the requested name exactly first,
+        then a list of common variants, and return the first one the
+        broker recognises.
+
+        Raises :class:`ValueError` with the tried list if no variant
+        is recognised; never silently falls back to a placeholder so
+        the caller can surface the real name to the trader.
+
+        Result MUST be the exact name that subsequent
+        :meth:`get_symbol_info` / :meth:`get_tick` / order calls will
+        accept — callers store the returned string on the block and
+        reuse it for the rest of the lifecycle.
+        """
 
     @abstractmethod
     async def get_symbol_info(self, symbol: str) -> SymbolInfo:

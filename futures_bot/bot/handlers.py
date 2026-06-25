@@ -24,6 +24,7 @@ from futures_bot.bot.formatters import (
     format_block_detail,
     format_block_summary,
     format_plan_preview,
+    format_stats,
 )
 from futures_bot.bot.keyboards import (
     CB_BLOCK_CANCEL,
@@ -40,6 +41,7 @@ from futures_bot.bot.keyboards import (
     CB_SIDE_BUY,
     CB_SIDE_SELL,
     CB_SYM_CUSTOM,
+    CB_SYM_HEADER,
     CB_SYM_PICK,
     block_submenu_keyboard,
     cancel_block_confirm_keyboard,
@@ -57,7 +59,7 @@ from futures_bot.db import (
     repository,
     session_scope,
 )
-from futures_bot.strategy.plan import build_plan
+from futures_bot.strategy.plan import build_plan, normalize_anchors
 from futures_bot.strategy.risk import SymbolSpec
 
 router = Router(name="futures_bot")
@@ -318,13 +320,24 @@ async def menu_balance(query: CallbackQuery, adapter: BrokerAdapter) -> None:
 
 @router.callback_query(F.data == CB_MENU_STATS)
 async def menu_stats(query: CallbackQuery) -> None:
-    """Statistics submenu is a follow-up feature — placeholder reply."""
+    """Render aggregated block stats from the DB."""
     await query.answer()
-    if query.message is not None:
-        await query.message.answer(
-            "📊 Статистика будет добавлена позже — "
-            "сначала проверим работу /newblock и /list."
-        )
+    if query.message is None:
+        return
+    async with session_scope() as session:
+        stats = await repository.compute_stats(session)
+    await query.message.answer(
+        format_stats(stats),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    """Slash-command twin of the 📊 Статистика inline button."""
+    async with session_scope() as session:
+        stats = await repository.compute_stats(session)
+    await _reply_html(message, format_stats(stats))
 
 
 # ===========================================================================
@@ -360,25 +373,34 @@ async def cmd_newblock(
 
 
 @router.callback_query(NewBlockFSM.SYMBOL, F.data.startswith(CB_SYM_PICK))
-async def fsm_symbol_pick(query: CallbackQuery, state: FSMContext) -> None:
-    """Picker button → record symbol, advance to side selection."""
+async def fsm_symbol_pick(
+    query: CallbackQuery,
+    state: FSMContext,
+    adapter: BrokerAdapter,
+) -> None:
+    """Picker button → resolve symbol against broker, advance to side."""
     if query.data is None or query.message is None:
         await query.answer()
         return
-    symbol = query.data[len(CB_SYM_PICK):].strip().upper()
-    # Mirror the validation the text handler runs so a malicious or
-    # corrupted callback doesn't smuggle a bogus value into state.
-    if len(symbol) < 3 or any(c.isspace() for c in symbol):
+    # Picker buttons carry the operator-configured symbol verbatim;
+    # don't change case here — the adapter's resolver knows about
+    # broker-specific casing (e.g. Exness's lowercase 'm' suffix).
+    requested = query.data[len(CB_SYM_PICK):].strip()
+    if len(requested) < 3 or any(c.isspace() for c in requested):
         await query.answer("Bad symbol", show_alert=True)
         return
-    await state.update_data(symbol=symbol)
-    await state.set_state(NewBlockFSM.SIDE)
-    await query.message.answer(
-        f"✅ Выбран: <code>{symbol}</code>\n\n"
-        "Шаг 2/6 — выберите сторону:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=side_keyboard(),
-    )
+    await _resolve_symbol_and_advance(query.message, state, adapter, requested)
+    await query.answer()
+
+
+@router.callback_query(F.data == CB_SYM_HEADER)
+async def fsm_symbol_header(query: CallbackQuery) -> None:
+    """Section-header buttons in the picker are non-interactive.
+
+    Telegram requires every InlineKeyboardButton to have a callback,
+    so we register a silent ack so a stray tap doesn't spin a loading
+    indicator forever.
+    """
     await query.answer()
 
 
@@ -400,31 +422,107 @@ async def fsm_symbol_custom(query: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(NewBlockFSM.SYMBOL, F.text)
-async def fsm_symbol(message: Message, state: FSMContext) -> None:
-    symbol = (message.text or "").strip().upper()
-    # MT5 symbol names can include letters and digits, sometimes
-    # a dot or underscore for Exness (e.g. "XAUUSD.s"). Be permissive.
-    if len(symbol) < 4 or any(c.isspace() for c in symbol):
+async def fsm_symbol(
+    message: Message,
+    state: FSMContext,
+    adapter: BrokerAdapter,
+) -> None:
+    # Preserve case: brokers are case-sensitive on suffixes
+    # (``EURUSDm`` ≠ ``EURUSDM``). The adapter's resolver will try
+    # both upper and as-typed; pre-uppercasing here would lose the
+    # 'm'.
+    requested = (message.text or "").strip()
+    # MT5 symbol names can include letters, digits, dots, hash,
+    # underscore. Be permissive on character set; tighten only on
+    # whitespace + minimum length.
+    if len(requested) < 3 or any(c.isspace() for c in requested):
         await message.answer("Неверный символ. Попробуйте ещё раз.")
         return
-    await state.update_data(symbol=symbol)
+    await _resolve_symbol_and_advance(message, state, adapter, requested)
+
+
+async def _resolve_symbol_and_advance(
+    message: Message,
+    state: FSMContext,
+    adapter: BrokerAdapter,
+    requested: str,
+) -> None:
+    """Resolve requested symbol against the broker, then move to SIDE.
+
+    On failure stays in the SYMBOL state so the trader can retry
+    without re-tapping `➕ Создать`. On success surfaces the
+    translation (e.g. ``EURUSD`` → ``EURUSDm``) so the trader knows
+    which broker symbol the rest of the block will reference.
+    """
+    try:
+        resolved = await adapter.resolve_symbol(requested)
+    except ValueError as exc:
+        await _reply_plain(message, f"❌ {exc}")
+        return  # stay in SYMBOL state, let user retry
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("resolve_symbol failed for {sym}", sym=requested)
+        await _reply_plain(
+            message,
+            f"❌ Не удалось проверить символ у брокера: {exc}",
+        )
+        return
+
+    await state.update_data(symbol=resolved, requested_symbol=requested)
     await state.set_state(NewBlockFSM.SIDE)
+
+    if resolved != requested:
+        # Surface the translation so the trader knows the bot mapped
+        # their input to the broker's actual name — useful debugging
+        # info when something later goes wrong.
+        confirmation = (
+            f"✅ Выбран: <code>{resolved}</code>\n"
+            f"<i>(вы указали {requested}, ваш брокер использует "
+            f"{resolved})</i>"
+        )
+    else:
+        confirmation = f"✅ Выбран: <code>{resolved}</code>"
+
     await message.answer(
-        "Шаг 2/6 — выберите сторону:",
+        f"{confirmation}\n\nШаг 2/6 — выберите сторону:",
+        parse_mode=ParseMode.HTML,
         reply_markup=side_keyboard(),
     )
 
 
 @router.callback_query(NewBlockFSM.SIDE, F.data.in_({CB_SIDE_BUY, CB_SIDE_SELL}))
-async def fsm_side(query: CallbackQuery, state: FSMContext) -> None:
+async def fsm_side(
+    query: CallbackQuery,
+    state: FSMContext,
+    adapter: BrokerAdapter,
+) -> None:
     side = BlockSide.BUY if query.data == CB_SIDE_BUY else BlockSide.SELL
     await state.update_data(side=str(side))
     await state.set_state(NewBlockFSM.ZERO_PRICE)
+
+    # Fetch the live tick so the 0% prompt can include the current
+    # ask/bid as a reference. Failure is silent — the prompt still
+    # works, just without the hint, and the trader can keep typing.
+    data = await state.get_data()
+    symbol = str(data.get("symbol") or "")
+    hint = ""
+    try:
+        tick = await adapter.get_tick(symbol)
+        hint = (
+            f"\n\n📍 Текущая цена: "
+            f"ask=<code>{tick.ask}</code>, "
+            f"bid=<code>{tick.bid}</code>"
+        )
+    except Exception:  # noqa: BLE001
+        # Logged at debug — it's fine for a fresh symbol on Market
+        # Watch to not have a tick yet.
+        logger.debug("tick fetch failed for {sym}; skipping hint", sym=symbol)
+
     msg = query.message
     if msg is not None:
         await msg.answer(
             "Шаг 3/6 — отправьте цену <b>0%</b> якоря.\n"
-            "Для BUY это <b>верх</b> диапазона; для SELL — <b>низ</b>.",
+            "Для BUY это <b>верх</b> диапазона; для SELL — <b>низ</b>."
+            + hint,
             parse_mode=ParseMode.HTML,
         )
     await query.answer()
@@ -451,12 +549,37 @@ async def fsm_hundred_price(message: Message, state: FSMContext) -> None:
     if price is None or price <= 0:
         await message.answer("Отправьте одно положительное число.")
         return
-    await state.update_data(hundred_price=price)
+
+    # Auto-correct orientation: if the trader entered the anchors the
+    # way they "feel" (price action chronologically) rather than the
+    # way the strategy requires (BUY: 0% above; SELL: 0% below), swap
+    # them and tell the trader. This catches the single most common
+    # mistake — typing 2640 first instead of 2660 for a BUY on gold.
+    data = await state.get_data()
+    side = BlockSide(data["side"])
+    zero_price = float(data["zero_price"])
+    hundred_price = price
+
+    new_zero, new_hundred, swapped = normalize_anchors(
+        side, zero_price, hundred_price
+    )
+
+    await state.update_data(zero_price=new_zero, hundred_price=new_hundred)
     await state.set_state(NewBlockFSM.BASE_RISK)
+
+    swap_note = ""
+    if swapped:
+        side_word = "выше" if side == BlockSide.BUY else "ниже"
+        swap_note = (
+            f"\n\n⚠️ <i>Якоря поменяны местами автоматически: "
+            f"0% = {new_zero}, 100% = {new_hundred} "
+            f"(для {side} 0% должна быть {side_word}).</i>"
+        )
+
     await message.answer(
         "Шаг 5/6 — <b>базовый риск</b> в USD на 1-й ордер.\n"
         "Остальные ордера получат 1.5×, 2.25×, 3.375×, 5.06×, 7.59× "
-        "от этой суммы.",
+        "от этой суммы." + swap_note,
         parse_mode=ParseMode.HTML,
     )
 

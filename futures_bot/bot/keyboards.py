@@ -159,36 +159,124 @@ def cancel_block_confirm_keyboard(block_id: int) -> InlineKeyboardMarkup:
     )
 
 
+# Symbol → category mapping. Used by ``instrument_picker_keyboard``
+# to group buttons under section headers. Unknown symbols (exotic
+# CFDs, broker-specific names) fall through to the "other" bucket.
+_SYMBOL_CATEGORY: dict[str, str] = {
+    # Precious metals
+    "XAUUSD": "metals", "XAGUSD": "metals",
+    "XPDUSD": "metals", "XPTUSD": "metals",
+    # Major FX (USD pairs the textbooks call "majors")
+    "EURUSD": "fx_major", "GBPUSD": "fx_major", "USDJPY": "fx_major",
+    "USDCHF": "fx_major", "USDCAD": "fx_major",
+    "AUDUSD": "fx_major", "NZDUSD": "fx_major",
+    # Cross-currency pairs (no USD leg)
+    "EURJPY": "fx_cross", "GBPJPY": "fx_cross", "EURGBP": "fx_cross",
+    "AUDJPY": "fx_cross", "CHFJPY": "fx_cross", "EURAUD": "fx_cross",
+    "EURCHF": "fx_cross", "GBPCHF": "fx_cross", "AUDCAD": "fx_cross",
+    "AUDNZD": "fx_cross", "NZDJPY": "fx_cross",
+    # Crypto
+    "BTCUSD": "crypto", "ETHUSD": "crypto", "LTCUSD": "crypto",
+    "XRPUSD": "crypto", "BCHUSD": "crypto", "DOGEUSD": "crypto",
+    # Equity indices
+    "US30": "indices", "US500": "indices", "NAS100": "indices",
+    "SPX500": "indices", "DAX40": "indices", "UK100": "indices",
+    "JPN225": "indices", "AUS200": "indices",
+}
+
+_CATEGORY_LABEL: dict[str, str] = {
+    "metals":   "🥇 Металлы",
+    "fx_major": "💱 Major FX",
+    "fx_cross": "💱 Cross FX",
+    "crypto":   "🪙 Crypto",
+    "indices":  "📈 Индексы",
+    "other":    "📊 Прочее",
+}
+
+# Stable display order — independent of operator's ``quick_symbols``
+# order so the trader always finds gold and majors in the same place.
+_CATEGORY_ORDER: list[str] = [
+    "metals", "fx_major", "fx_cross", "crypto", "indices", "other",
+]
+
+# Callback string for section-header buttons. No handler subscribes
+# to it; ``handlers.py`` answers with a silent ack so a stray tap
+# doesn't time out at the Telegram side.
+CB_SYM_HEADER = "sym:header"
+
+
+def _classify(symbol: str) -> str:
+    """Bucket a symbol into a category, falling through to ``other``."""
+    upper = symbol.upper()
+    if upper in _SYMBOL_CATEGORY:
+        return _SYMBOL_CATEGORY[upper]
+    # Prefix fallback so Exness suffixes (XAUUSDm, EURUSD.s, etc.)
+    # inherit their parent symbol's category for free.
+    for prefix, category in _SYMBOL_CATEGORY.items():
+        if upper.startswith(prefix):
+            return category
+    return "other"
+
+
 def instrument_picker_keyboard(
     symbols: "list[str]",
     *,
     columns: int = 3,
 ) -> InlineKeyboardMarkup:
-    """Quick-pick grid of instruments + ``Другой`` and ``Назад`` row.
+    """Symbols grouped by category, with section headers + footer row.
 
-    The grid wraps every ``columns`` symbols. A trailing partial row
-    is preserved (so 7 symbols at 3 cols becomes 3+3+1, not 3+3+1+blank).
-    The ``Другой`` button takes the trader to a free-text symbol prompt
-    so unusual names (Exness suffixes, custom CFDs) are still reachable
-    without editing the config.
+    Layout (top to bottom):
+
+    1. For each non-empty category in :data:`_CATEGORY_ORDER`, a
+       section-header row (``── 💱 Major FX ──``) followed by the
+       symbols in that bucket wrapped to ``columns``.
+    2. A trailing ``✏️ Другой / ⬅️ Назад`` row.
+
+    Section headers carry the :data:`CB_SYM_HEADER` callback which
+    the handler module answers as a silent no-op so accidental taps
+    don't spin a Telegram "loading" indicator. Buckets preserve the
+    order of ``symbols``, so the operator can tune within-category
+    ordering via ``quick_symbols`` in ``.env`` without touching the
+    keyboard code.
     """
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
+    # Bucket symbols by category, preserving operator-supplied order
+    # within each bucket. Empty strings (a stray trailing comma in
+    # .env) are dropped so they don't surface as a blank button.
+    buckets: dict[str, list[str]] = {cat: [] for cat in _CATEGORY_ORDER}
     for sym in symbols:
         cleaned = sym.strip()
         if not cleaned:
             continue
-        row.append(
+        buckets[_classify(cleaned)].append(cleaned)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for category in _CATEGORY_ORDER:
+        bucket = buckets[category]
+        if not bucket:
+            continue
+        # Section header — full-width label, no real interaction.
+        rows.append([
             InlineKeyboardButton(
-                text=f"{_emoji_for(cleaned)} {cleaned}",
-                callback_data=f"{CB_SYM_PICK}{cleaned}",
+                text=f"── {_CATEGORY_LABEL[category]} ──",
+                callback_data=CB_SYM_HEADER,
             )
-        )
-        if len(row) == columns:
+        ])
+        # Symbol buttons wrapped to ``columns``.
+        row: list[InlineKeyboardButton] = []
+        for sym in bucket:
+            row.append(
+                InlineKeyboardButton(
+                    text=f"{_emoji_for(sym)} {sym}",
+                    callback_data=f"{CB_SYM_PICK}{sym}",
+                )
+            )
+            if len(row) == columns:
+                rows.append(row)
+                row = []
+        if row:
             rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+
+    # Trailing footer row — always present even when no symbols match.
     rows.append([
         InlineKeyboardButton(text="✏️ Другой", callback_data=CB_SYM_CUSTOM),
         InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU_BLOCK),

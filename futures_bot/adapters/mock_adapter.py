@@ -37,6 +37,7 @@ from futures_bot.adapters.base import (
     Position,
     SymbolInfo,
     Tick,
+    symbol_name_candidates,
 )
 from futures_bot.db.enums import BlockSide
 
@@ -127,7 +128,13 @@ class MockAdapter(BrokerAdapter):
         symbols: dict[str, SymbolInfo] | None = None,
     ) -> None:
         self._balance = starting_balance
-        self._symbols: dict[str, SymbolInfo] = dict(symbols or _DEFAULT_SYMBOLS)
+        # Use ``is None`` (not ``or``) so that an explicit empty dict
+        # is preserved — tests that want to start with no symbols
+        # registered should be able to do so, then call ``add_symbol``
+        # to populate just the names they care about.
+        self._symbols: dict[str, SymbolInfo] = (
+            dict(_DEFAULT_SYMBOLS) if symbols is None else dict(symbols)
+        )
         self._ticks: dict[str, Tick] = {}
         self._pending: dict[str, _PendingOrder] = {}
         self._positions: dict[str, _OpenPosition] = {}
@@ -162,6 +169,16 @@ class MockAdapter(BrokerAdapter):
 
     async def is_connected(self) -> bool:
         return self._connected
+
+    async def resolve_symbol(self, requested: str) -> str:
+        # Walk the same candidate list the production MT5 adapter
+        # uses, but match against the in-memory catalogue. Tests that
+        # register a suffixed name via :meth:`add_symbol` exercise the
+        # same code path the live broker would.
+        for candidate in symbol_name_candidates(requested):
+            if candidate in self._symbols:
+                return candidate
+        raise ValueError(f"unknown symbol: {requested!r}")
 
     async def get_symbol_info(self, symbol: str) -> SymbolInfo:
         info = self._symbols.get(symbol)

@@ -38,6 +38,7 @@ from futures_bot.adapters.base import (
     Position,
     SymbolInfo,
     Tick,
+    symbol_name_candidates,
 )
 from futures_bot.config import Settings
 from futures_bot.db.enums import BlockSide
@@ -111,6 +112,10 @@ class MT5Adapter(BrokerAdapter):
         # disconnect so a reconnect after a broker session reset
         # picks up any changed metadata.
         self._symbol_cache: dict[str, SymbolInfo] = {}
+        # Resolution cache: requested → broker-actual name. Populated
+        # on every successful :meth:`resolve_symbol`. Cleared on
+        # disconnect so a reconnect rediscovers names cleanly.
+        self._resolved_cache: dict[str, str] = {}
 
     # ---- Lifecycle ----
 
@@ -185,9 +190,45 @@ class MT5Adapter(BrokerAdapter):
                     logger.warning("MT5 shutdown raised: {err}", err=exc)
             self._connected = False
             self._symbol_cache.clear()
+            self._resolved_cache.clear()
 
     async def is_connected(self) -> bool:
         return self._connected and self._mt5 is not None
+
+    # ---- Symbol resolution ----
+
+    async def resolve_symbol(self, requested: str) -> str:
+        # Cache hit before grabbing the lock — read of a dict[str, str]
+        # is atomic in CPython so a racing miss is harmless.
+        cleaned = requested.strip()
+        cached = self._resolved_cache.get(cleaned)
+        if cached is not None:
+            return cached
+        async with self._lock:
+            cached = self._resolved_cache.get(cleaned)
+            if cached is not None:
+                return cached
+            return await asyncio.to_thread(self._sync_resolve_symbol, cleaned)
+
+    def _sync_resolve_symbol(self, requested: str) -> str:
+        client = self._require_client()
+        candidates = symbol_name_candidates(requested)
+        for name in candidates:
+            info = client.symbol_info(name)
+            if info is None:
+                continue
+            # Hot the symbol into Market Watch so subsequent tick /
+            # order calls don't trip on "not visible".
+            client.symbol_select(name, True)
+            self._resolved_cache[requested] = name
+            return name
+        raise ValueError(
+            f"unknown symbol on broker: {requested!r}. "
+            f"Tried: {candidates}. "
+            f"Check the symbol name in MT5 'Market Watch'. Exness mini "
+            f"accounts often suffix names (e.g. EURUSDm); other brokers "
+            f"use '.s', '.r', '.cash', or '#'."
+        )
 
     # ---- Market data ----
 

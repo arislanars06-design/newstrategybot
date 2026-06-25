@@ -10,7 +10,8 @@ is the caller's job via ``session_scope``.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -219,3 +220,114 @@ async def mark_order_cancelled(
 ) -> None:
     order.state = OrderState.CANCELLED
     order.closed_at = closed_at
+
+
+# ---------------------------------------------------------------------
+# Stats aggregation
+# ---------------------------------------------------------------------
+
+@dataclass(slots=True, frozen=True)
+class StatsSummary:
+    """Aggregated per-block statistics for the Telegram stats view.
+
+    All fields are immutable so they can be safely passed across the
+    formatter boundary without anyone mutating them in-flight. The
+    counts are integers; PnLs are USD (or whatever currency the
+    account is denominated in) rounded to two decimal places.
+    """
+
+    total: int
+    active: int
+    wins: int
+    losses: int
+    invalid: int
+    errored: int
+    total_pnl: float
+    win_rate: float | None     # None when no decisive (WIN/LOSS) blocks
+    pnl_last_7d: float
+    by_symbol_top: tuple[tuple[str, int, float], ...] = field(default_factory=tuple)
+
+
+async def compute_stats(
+    session: AsyncSession,
+    *,
+    now: datetime | None = None,
+    top_symbol_limit: int = 5,
+) -> StatsSummary:
+    """Aggregate block counts and PnL into a :class:`StatsSummary`.
+
+    Done in Python rather than SQL because the table is intentionally
+    small (a discretionary trader rarely hits triple-digit blocks/day),
+    and Python-side aggregation is easier to read than three or four
+    parallel SQL grouping clauses. If the table grows past low-tens-
+    of-thousands of rows we can revisit.
+
+    Args:
+        session: open async session (read-only is fine).
+        now: override "current time" for testability; defaults to UTC now.
+        top_symbol_limit: how many symbols to surface in the breakdown.
+    """
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
+    week_ago = now - timedelta(days=7)
+
+    stmt = select(Block)
+    result = await session.execute(stmt)
+    blocks = list(result.scalars().all())
+
+    total = len(blocks)
+    active = sum(
+        1 for b in blocks
+        if b.status in (BlockStatus.CREATED, BlockStatus.ACTIVE)
+    )
+    wins = sum(1 for b in blocks if b.status == BlockStatus.WIN)
+    losses = sum(1 for b in blocks if b.status == BlockStatus.LOSS)
+    invalid = sum(1 for b in blocks if b.status == BlockStatus.INVALID)
+    errored = sum(1 for b in blocks if b.status == BlockStatus.ERROR)
+
+    # PnL totals only count terminal blocks — active blocks have no
+    # net_pnl yet, and an in-flight unrealised number would mislead
+    # the trader at a glance.
+    total_pnl = 0.0
+    pnl_last_7d = 0.0
+    for b in blocks:
+        if not b.is_terminal:
+            continue
+        net = b.net_pnl or 0.0
+        total_pnl += net
+        if b.closed_at is not None:
+            closed_aware = b.closed_at
+            if closed_aware.tzinfo is None:
+                closed_aware = closed_aware.replace(tzinfo=timezone.utc)
+            if closed_aware >= week_ago:
+                pnl_last_7d += net
+
+    decided = wins + losses
+    win_rate = (wins / decided) if decided > 0 else None
+
+    # By-symbol breakdown. Track both block count and PnL per symbol;
+    # sort by count so the most-used pair surfaces first.
+    by_symbol: dict[str, list[float]] = {}
+    for b in blocks:
+        agg = by_symbol.setdefault(b.symbol, [0, 0.0])
+        agg[0] += 1                                  # block count
+        if b.is_terminal:
+            agg[1] += float(b.net_pnl or 0.0)        # cumulative pnl
+    top = sorted(
+        ((sym, int(c), float(p)) for sym, (c, p) in by_symbol.items()),
+        key=lambda t: (t[1], abs(t[2])),
+        reverse=True,
+    )[:top_symbol_limit]
+
+    return StatsSummary(
+        total=total,
+        active=active,
+        wins=wins,
+        losses=losses,
+        invalid=invalid,
+        errored=errored,
+        total_pnl=round(total_pnl, 2),
+        win_rate=round(win_rate, 4) if win_rate is not None else None,
+        pnl_last_7d=round(pnl_last_7d, 2),
+        by_symbol_top=tuple(top),
+    )

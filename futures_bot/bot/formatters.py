@@ -17,6 +17,7 @@ from typing import Any
 from futures_bot.core.notifications import Notification, NotificationType
 from futures_bot.db.enums import BlockStatus, OrderState
 from futures_bot.db.models import Block
+from futures_bot.db.repository import StatsSummary
 from futures_bot.strategy.plan import BlockPlan
 
 
@@ -249,6 +250,62 @@ def format_balance(*, balance: float, equity: float, free_margin: float) -> str:
 
 
 # ============================================================================
+# Statistics
+# ============================================================================
+
+def format_stats(stats: StatsSummary) -> str:
+    """Render aggregated block stats for the 📊 Статистика screen.
+
+    Empty-state path: when no blocks exist at all, return a single
+    friendly line that doubles as a CTA — keeps the chat from
+    showing a wall of zeros on first launch.
+    """
+    if stats.total == 0:
+        return (
+            "📊 <b>Статистика</b>\n\n"
+            "Пока нет ни одного блока. Создайте первый через "
+            "<b>📦 Блок → ➕ Создать</b>."
+        )
+
+    lines: list[str] = [
+        "📊 <b>Статистика</b>",
+        "",
+        f"Всего блоков: <b>{stats.total}</b>",
+        f"  🟡 Активные: <b>{stats.active}</b>",
+        f"  🟢 Выигрыши: <b>{stats.wins}</b>",
+        f"  🔴 Убытки: <b>{stats.losses}</b>",
+    ]
+    # Only show INVALID / ERROR rows when they have content — keeps
+    # the message tight for users whose blocks all reach a clean end.
+    if stats.invalid:
+        lines.append(f"  ⚫ Отменены (INVALID): <b>{stats.invalid}</b>")
+    if stats.errored:
+        lines.append(f"  🚨 Ошибки: <b>{stats.errored}</b>")
+
+    if stats.win_rate is not None:
+        lines.append(f"  • <b>Win rate: {stats.win_rate * 100:.1f}%</b>")
+
+    lines.extend([
+        "",
+        f"💰 Итоговый PnL: <b>{_signed(stats.total_pnl, 2)}</b> USD",
+        f"📅 PnL за 7 дней: <b>{_signed(stats.pnl_last_7d, 2)}</b> USD",
+    ])
+
+    if stats.by_symbol_top:
+        lines.append("")
+        lines.append("<b>Топ инструментов:</b>")
+        for sym, count, pnl in stats.by_symbol_top:
+            # Always show the PnL — even at zero it tells the trader
+            # that the symbol was used but hasn't closed any block yet.
+            lines.append(
+                f"  <code>{_h(sym)}</code> — {count} блок(а), "
+                f"PnL <b>{_signed(pnl, 2)}</b>"
+            )
+
+    return "\n".join(lines)
+
+
+# ============================================================================
 # Engine notifications → channel/chat messages
 # ============================================================================
 
@@ -350,6 +407,7 @@ __all__ = [
     "format_block_detail",
     "format_block_summary",
     "format_plan_preview",
+    "format_stats",
     "render_notification",
 ]
 
