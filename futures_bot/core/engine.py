@@ -494,6 +494,21 @@ class BlockEngine:
                     tp=tp_live,
                     lot=order.lot,
                     spread=tick.spread,
+                    # Distances in MT5 points (smallest price unit
+                    # the broker exposes — ``symbol_info.point``).
+                    # Knowing 'SL = 45 п' alongside '1.13496' lets the
+                    # trader sanity-check the chain-rule SL without
+                    # subtracting prices by hand.
+                    sl_points=(
+                        abs(sl_live - order.entry_price) / symbol_info.point
+                        if symbol_info.point
+                        else None
+                    ),
+                    tp_points=(
+                        abs(tp_live - order.entry_price) / symbol_info.point
+                        if symbol_info.point
+                        else None
+                    ),
                 )
             )
 

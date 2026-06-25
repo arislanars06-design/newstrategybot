@@ -100,6 +100,29 @@ def _cancel_price_label(cancel_price: float | None) -> str:
     return str(cancel_price)
 
 
+def _points_suffix(points: float | None) -> str:
+    """Render an inline ' (N п)' marker next to an SL/TP price.
+
+    Returns an empty string when ``points`` is None — keeps the
+    rest of the message intact for renderers that emit older
+    payloads without the distance field (e.g. notifications
+    persisted before the points columns existed).
+
+    The Russian abbreviation "п" stands for "пункт" — the
+    smallest price unit the broker quotes, exactly how MT5's
+    own UI labels it. One pip equals 10 points on a 5-digit
+    pair, 100 points on most gold/silver feeds — keeping the
+    label in points avoids us guessing which scale the trader's
+    instrument uses.
+    """
+    if points is None:
+        return ""
+    # One decimal is enough to distinguish chain-rule SLs (45.5 п)
+    # from the bare-step alternative (33.5 п); more decimals would
+    # just be noise on the small phone screens this lands on.
+    return f" <i>({round(float(points), 1)} п)</i>"
+
+
 def _block_trade_counter(block: Block) -> str:
     """Compact closed/total summary with per-state breakdown."""
     counts: dict[str, int] = {}
@@ -402,8 +425,10 @@ def render_notification(n: Notification) -> str:  # noqa: PLR0911
             f"📍 <b>БЛОК #{n.block_id}</b>\n"
             f"Ордер <b>#{p.get('seq')}</b> сработал по цене "
             f"<code>{p.get('entry')}</code>\n"
-            f"SL: <code>{p.get('sl')}</code>  "
-            f"TP: <code>{p.get('tp')}</code>  "
+            f"SL: <code>{p.get('sl')}</code>"
+            f"{_points_suffix(p.get('sl_points'))}  "
+            f"TP: <code>{p.get('tp')}</code>"
+            f"{_points_suffix(p.get('tp_points'))}  "
             f"Объём: <code>{p.get('lot')}</code>\n"
             f"Спред при заполнении: <code>{p.get('spread')}</code>"
         )
