@@ -24,12 +24,14 @@ from futures_bot.bot.formatters import (
     format_block_detail,
     format_block_summary,
     format_plan_preview,
+    format_session_info,
     format_stats,
 )
 from futures_bot.bot.keyboards import (
     CB_BLOCK_CANCEL,
     CB_BLOCK_CREATE,
     CB_BLOCK_LIST,
+    CB_BLOCK_SESSION,
     CB_CANCEL,
     CB_CANCEL_BLOCK_CONFIRM,
     CB_CANCEL_BLOCK_PICK,
@@ -190,6 +192,24 @@ async def block_list_cb(query: CallbackQuery) -> None:
     await query.answer()
     if query.message is not None:
         await cmd_list(query.message)
+
+
+@router.callback_query(F.data == CB_BLOCK_SESSION)
+async def block_session_cb(query: CallbackQuery) -> None:
+    """📅 Сессия — show current trading session and recommendations.
+
+    Pure info screen. Doesn't transition the FSM and doesn't touch
+    the broker; just rebuilds the formatted session message from the
+    current wall clock so the trader sees a fresh value on every tap.
+    """
+    await query.answer()
+    if query.message is None:
+        return
+    await query.message.answer(
+        format_session_info(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=block_submenu_keyboard(),
+    )
 
 
 @router.callback_query(F.data == CB_BLOCK_CANCEL)

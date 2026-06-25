@@ -38,6 +38,7 @@ CB_MENU_BACK = "menu:back"
 CB_BLOCK_CREATE = "block:create"
 CB_BLOCK_LIST = "block:list"
 CB_BLOCK_CANCEL = "block:cancel"
+CB_BLOCK_SESSION = "block:session"     # info screen — no FSM transition
 
 # --- /cancel picker / confirm flow ---
 CB_CANCEL_BLOCK_PICK = "cb:pick:"        # + <block_id>
@@ -124,7 +125,12 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def block_submenu_keyboard() -> InlineKeyboardMarkup:
-    """Block submenu — Создать / Активные / Отменить / Назад.
+    """Block submenu — Создать / Активные / Сессия / Отменить / Назад.
+
+    The session button is a pure-info shortcut: tapping it surfaces
+    the current trading session(s) and the per-session recommended
+    instruments, without entering any FSM. The trader can then go
+    back here and tap "Создать" to use one of the recommendations.
 
     No /modify equivalent yet: futures-side cancel-price is set once
     and the trader prefers /cancel + new block to mid-flight tweaks.
@@ -134,6 +140,7 @@ def block_submenu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Создать", callback_data=CB_BLOCK_CREATE)],
             [InlineKeyboardButton(text="📋 Активные блоки", callback_data=CB_BLOCK_LIST)],
+            [InlineKeyboardButton(text="📅 Сессия", callback_data=CB_BLOCK_SESSION)],
             [InlineKeyboardButton(text="✋ Отменить", callback_data=CB_BLOCK_CANCEL)],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU_BACK)],
         ]

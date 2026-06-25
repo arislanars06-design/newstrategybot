@@ -392,6 +392,95 @@ def format_stats(stats: StatsSummary) -> str:
 
 
 # ============================================================================
+# Trading session info
+# ============================================================================
+
+def format_session_info(now: datetime | None = None) -> str:
+    """Render the current-session screen for the 📅 Сессия button.
+
+    Three modes:
+
+    * One or more sessions active → list them, show recommended
+      instruments grouped by tier glyph, and a 'next session in Nh'
+      footer.
+    * No session active (weekend / between-sessions sliver) → say
+      so explicitly and surface the next opening time.
+    """
+    from futures_bot.bot.keyboards import _TIER_EMOJI, _tier_for
+    from futures_bot.strategy.sessions import (
+        active_sessions,
+        next_session_after,
+        recommended_symbols_for,
+    )
+
+    now_utc = (
+        now.astimezone(timezone.utc) if (now and now.tzinfo)
+        else (now.replace(tzinfo=timezone.utc) if now else datetime.now(tz=timezone.utc))
+    )
+    local = now_utc.astimezone(_TASHKENT_TZ)
+    active = active_sessions(now_utc)
+
+    if not active:
+        # Off-hours path. Still show the time so the trader confirms
+        # the bot isn't stuck on yesterday's clock.
+        next_window, next_dt = next_session_after(now_utc)
+        hours_until = max(0.1, (next_dt - now_utc).total_seconds() / 3600)
+        return (
+            "📅 <b>Сессия не открыта</b>\n\n"
+            f"⏰ UTC: <code>{now_utc.strftime('%H:%M')}</code>  "
+            f"Ташкент: <code>{local.strftime('%H:%M')}</code>\n\n"
+            f"⏭ Следующая: <b>{next_window.label}</b> через "
+            f"<b>{hours_until:.1f}ч</b>"
+        )
+
+    lines: list[str] = [
+        "📅 <b>Текущая торговая сессия</b>",
+        "",
+        f"⏰ UTC: <code>{now_utc.strftime('%H:%M')}</code>  "
+        f"Ташкент: <code>{local.strftime('%H:%M')}</code>",
+        "",
+    ]
+    # First line lists every active session. London/NY overlap appears
+    # first when present so the trader sees the headline window before
+    # the constituent sessions.
+    for window in active:
+        lines.append(
+            f"🟢 <b>{window.label}</b>  "
+            f"<i>({window.start_hour:02d}:00–{window.end_hour:02d}:00 UTC)</i>"
+        )
+
+    # Recommended instruments — grouped by tier so the trader's
+    # preferred picks (🥇 рекомендованные) lead the way.
+    recs = recommended_symbols_for(active)
+    if recs:
+        by_tier: dict[str, list[str]] = {"A": [], "B": [], "C": [], "D": [], "?": []}
+        for sym in recs:
+            by_tier[_tier_for(sym)].append(sym)
+        lines.extend(["", "<b>🎯 Рекомендуемые инструменты:</b>"])
+        # Order matches the picker: 🥇 → 🥈 → 🥉 → ⚠️ → 📊.
+        for tier in ("A", "B", "C", "D", "?"):
+            bucket = by_tier[tier]
+            if not bucket:
+                continue
+            joined = ", ".join(f"<code>{_h(s)}</code>" for s in bucket)
+            lines.append(f"{_TIER_EMOJI[tier]} {joined}")
+
+    # Footer with the next-session ETA. Skip when the next session
+    # is in the same window we already listed (e.g. London active,
+    # next is the overlap inside London).
+    next_window, next_dt = next_session_after(now_utc)
+    hours_until = (next_dt - now_utc).total_seconds() / 3600
+    if hours_until > 0:
+        lines.append("")
+        lines.append(
+            f"⏭ Далее: <b>{next_window.label}</b> через "
+            f"<b>{hours_until:.1f}ч</b>"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================================
 # Engine notifications → channel/chat messages
 # ============================================================================
 
@@ -501,6 +590,7 @@ __all__ = [
     "format_block_detail",
     "format_block_summary",
     "format_plan_preview",
+    "format_session_info",
     "format_stats",
     "render_notification",
 ]
