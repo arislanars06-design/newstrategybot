@@ -206,3 +206,89 @@ class TestCreateBlockWithoutCancel:
         assert block.cancel_price_active is False
         # Placeholder for the NOT NULL column — equals zero_price.
         assert block.cancel_price == pytest.approx(plan.zero_price)
+
+
+class TestCancelAtZeroAnchor:
+    """FSM-equivalent test: cancel_price defaulted to zero_price."""
+
+    def test_buy_block_uses_zero_anchor_as_cancel_line(self):
+        # The trader asked the FSM to skip the cancel-price prompt
+        # and use the 0%-anchor automatically. ``build_plan`` happily
+        # accepts ``cancel_price=zero_price`` because the orientation
+        # invariant (cancel above entries for BUY) is satisfied —
+        # the 0% level sits above every retracement entry by design.
+        plan = build_plan(
+            symbol="XAUUSD",
+            side=BlockSide.BUY,
+            zero_price=2660.0,
+            hundred_price=2640.0,
+            base_risk_usd=5.0,
+            cancel_price=2660.0,           # = zero_price
+            symbol_spec=_xau_spec(),
+        )
+        assert plan.cancel_price == 2660.0
+        # Strict orientation: cancel > every entry for BUY.
+        for r in plan.rungs:
+            assert plan.cancel_price > r.entry
+
+    def test_sell_block_uses_zero_anchor_as_cancel_line(self):
+        # SELL mirror: 0% is the bottom of the range, and entries
+        # ascend above it. cancel_price=zero_price satisfies
+        # cancel < entries[0] for the orientation check.
+        plan = build_plan(
+            symbol="EURUSDm",
+            side=BlockSide.SELL,
+            zero_price=1.13285,
+            hundred_price=1.13551,
+            base_risk_usd=0.5,
+            cancel_price=1.13285,          # = zero_price
+            symbol_spec=SymbolSpec(
+                symbol="EURUSDm",
+                trade_tick_size=0.00001,
+                trade_tick_value=1.0,
+                volume_min=0.01,
+                volume_max=200.0,
+                volume_step=0.01,
+            ),
+        )
+        assert plan.cancel_price == 1.13285
+        # Strict orientation: cancel < every entry for SELL.
+        for r in plan.rungs:
+            assert plan.cancel_price < r.entry
+
+    @pytest.mark.asyncio
+    async def test_block_persists_zero_anchor_cancel_active(self, db) -> None:
+        # End-to-end: a plan with cancel_price=zero_price produces a
+        # Block whose cancel-price guard is *active* and stored at
+        # the zero-anchor value. This is the mode the FSM uses now.
+        adapter = MockAdapter()
+        adapter.add_symbol(SymbolInfo(
+            symbol="XAUUSD",
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+            trade_contract_size=100.0,
+            volume_min=0.01,
+            volume_max=200.0,
+            volume_step=0.01,
+            trade_stops_level=0,
+            spread_typical=0.05,
+        ))
+        await adapter.connect()
+        engine = BlockEngine(settings=_settings(), adapter=adapter)
+
+        plan = build_plan(
+            symbol="XAUUSD",
+            side=BlockSide.BUY,
+            zero_price=2660.0,
+            hundred_price=2640.0,
+            base_risk_usd=5.0,
+            cancel_price=2660.0,
+            symbol_spec=_xau_spec(),
+        )
+        block = await engine.create_block(plan, chat_id=1)
+        assert block is not None
+        # Guard is *active* — engine will evaluate it on every tick.
+        assert block.cancel_price_active is True
+        assert block.cancel_price == pytest.approx(2660.0)

@@ -725,10 +725,15 @@ async def fsm_base_risk(
             zero_price=zero_price,
             hundred_price=hundred_price,
             base_risk_usd=base_risk,
-            # Cancel-price guard is disabled by design — the FSM
-            # no longer collects this input. The block will run
-            # until fills / SL / TP / manual cancel.
-            cancel_price=None,
+            # Cancel-price guard auto-set to the 0% anchor itself —
+            # the trader explicitly asked the FSM not to prompt for
+            # this value, and the 0% level is the natural "thesis
+            # invalidation" line: if price moves past it the
+            # Fibonacci retracement we're trading no longer makes
+            # sense. ``zero_price`` satisfies the orientation
+            # invariant (above entries for BUY, below for SELL) so
+            # ``build_plan``'s validator accepts it.
+            cancel_price=zero_price,
             symbol_spec=symbol_spec,
             # Push live spread + the configured safety multiplier
             # through so the plan sizes lots against the effective
