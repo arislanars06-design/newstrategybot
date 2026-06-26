@@ -198,6 +198,29 @@ class OrderResult:
 # Adapter contract
 # ---------------------------------------------------------------------
 
+@dataclass(slots=True, frozen=True)
+class ClosedPositionInfo:
+    """Outcome of a position that has already left the broker's books.
+
+    Returned by :meth:`BrokerAdapter.get_position_close_info` so the
+    reconciliation pass on bot restart can attribute a closed
+    position to SL, TP, or a manual / unusual close — without
+    guessing from prices alone (a position closed exactly at SL by
+    a third-party tool would otherwise be indistinguishable from
+    a manual close).
+
+    ``reason`` is a normalised string instead of the MT5 numeric
+    code so the engine, formatters, and tests don't have to import
+    broker-specific constants.
+    """
+
+    ticket: str
+    close_price: float
+    close_time: datetime
+    profit: float           # broker-reported, includes commissions
+    reason: str             # one of: "SL", "TP", "MANUAL", "OTHER"
+
+
 class BrokerAdapter(ABC):
     """Common surface every concrete broker adapter must implement.
 
@@ -317,4 +340,23 @@ class BrokerAdapter(ABC):
         we need (ticket, price, status) is already on it. Adapter
         implementations fill in ``filled_price=None`` for genuinely
         pending orders.
+        """
+
+    @abstractmethod
+    async def get_position_close_info(
+        self, ticket: str
+    ) -> "ClosedPositionInfo | None":
+        """Look up a closed position by its ticket.
+
+        Returns ``None`` when no matching closing deal exists in
+        the broker's history — interpret that as "the position is
+        still open, or the ticket never produced a position (e.g.
+        the pending order was cancelled before fill)".
+
+        Used by :meth:`BlockEngine.reconcile_open_blocks` on
+        startup to attribute closed positions to SL / TP / manual
+        close. The MT5 implementation queries the trade history
+        via ``history_deals_get(position=ticket)`` and inspects
+        the exit deal's ``reason`` field; the mock keeps an
+        in-memory ledger of closures for the tests.
         """

@@ -79,6 +79,25 @@ async def _runner() -> None:
         adapter=adapter,
     )
 
+    # State reconciliation: bring DB rows back in sync with broker
+    # state before the watcher starts pumping ticks. Any pending
+    # order that filled / was cancelled, any open position that
+    # SL'd / TP'd / was manually closed while the bot was down
+    # gets attributed here so the trader sees one consolidated
+    # 🔄 BLOCK_RECONCILED message per affected block instead of a
+    # flood of synthetic SL/TP events. Wrapped defensively because
+    # a broker hiccup at startup must not stop the bot from
+    # answering /start — the alternative (block startup on broker
+    # health) would leave the operator without a Telegram lifeline
+    # during exactly the kind of outage we need to recover from.
+    try:
+        await engine.reconcile_open_blocks()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Startup reconciliation failed (continuing anyway): {err}",
+            err=exc,
+        )
+
     # The TickWatcher is the second long-running task in the
     # process. It polls the broker for fresh quotes on every active
     # symbol and feeds them into ``engine.on_tick``, which is what

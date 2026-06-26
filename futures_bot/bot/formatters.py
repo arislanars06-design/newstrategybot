@@ -564,6 +564,27 @@ def render_notification(n: Notification) -> str:  # noqa: PLR0911
             f"Требуется ручная проверка."
         )
 
+    if n.type == NotificationType.BLOCK_RECONCILED:
+        # On bot startup we may have caught up on N events that
+        # fired while we were down; render them all in one message
+        # so the channel doesn't get flooded with a stream of
+        # synthetic SL/TP notifications.
+        changes = p.get("changes") or []
+        new_status = p.get("new_status") or "ACTIVE"
+        net_pnl = p.get("net_pnl")
+        lines = [
+            f"🔄 <b>БЛОК #{n.block_id} синхронизирован</b>",
+        ]
+        if changes:
+            lines.append("")
+            for change in changes:
+                lines.append(f"  • {_h(str(change))}")
+        lines.append("")
+        lines.append(f"Статус: <b>{_h(str(new_status))}</b>")
+        if net_pnl is not None:
+            lines.append(f"PnL: <b>{_signed(float(net_pnl), 4)}</b>")
+        return "\n".join(lines)
+
     if n.type == NotificationType.BLOCK_MANUAL_CLOSE:
         net = p.get("net_pnl") or 0.0
         return (

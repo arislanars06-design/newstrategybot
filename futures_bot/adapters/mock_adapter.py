@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 
 from futures_bot.adapters.base import (
     BrokerAdapter,
+    ClosedPositionInfo,
     OrderRequest,
     OrderResult,
     Position,
@@ -138,6 +139,12 @@ class MockAdapter(BrokerAdapter):
         self._ticks: dict[str, Tick] = {}
         self._pending: dict[str, _PendingOrder] = {}
         self._positions: dict[str, _OpenPosition] = {}
+        # Ledger of closed positions, indexed by ticket. The startup
+        # reconciliation path queries this when a position that
+        # used to be open is no longer in ``self._positions``. Tests
+        # populate it by calling :meth:`record_position_close` to
+        # stage the "bot was down while a position closed" scenario.
+        self._closed_positions: dict[str, ClosedPositionInfo] = {}
         self._next_ticket: int = 1_000_000
         self._connected: bool = False
         self._lock = asyncio.Lock()
@@ -384,6 +391,38 @@ class MockAdapter(BrokerAdapter):
                 )
             )
         return out
+
+    # ---- Reconciliation support ----
+
+    def record_position_close(
+        self,
+        *,
+        ticket: str,
+        close_price: float,
+        close_time: datetime | None = None,
+        profit: float = 0.0,
+        reason: str = "SL",
+    ) -> None:
+        """Stage a closed-position record so reconciliation can find it.
+
+        Tests for :meth:`BlockEngine.reconcile_open_blocks` use this
+        to simulate "bot was down while the position SL'd or TP'd".
+        Drop the position from :attr:`_positions` separately if you
+        also need it absent from the open-positions list.
+        """
+        self._closed_positions[ticket] = ClosedPositionInfo(
+            ticket=ticket,
+            close_price=close_price,
+            close_time=close_time or _utcnow(),
+            profit=profit,
+            reason=reason,
+        )
+
+    async def get_position_close_info(
+        self, ticket: str
+    ) -> ClosedPositionInfo | None:
+        async with self._lock:
+            return self._closed_positions.get(ticket)
 
     # ---- Internals ----
 

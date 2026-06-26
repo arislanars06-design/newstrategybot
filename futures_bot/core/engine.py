@@ -43,6 +43,7 @@ from futures_bot.adapters.base import (
     BrokerAdapter,
     OrderRequest,
     OrderResult,
+    Position,
     SymbolInfo,
     Tick,
 )
@@ -305,6 +306,291 @@ class BlockEngine:
                 await self._process_fills(session, block, tick)
                 await self._process_exits(session, block, tick)
                 await self._finalise_block_state(session, block)
+
+    # ===================================================================
+    # Public API: startup reconciliation
+    # ===================================================================
+
+    async def reconcile_open_blocks(self) -> None:
+        """Sync DB state for every non-terminal block with the broker.
+
+        Called once at startup before the tick watcher begins polling.
+        It answers a single question for each open block: while we
+        were down, what changed on the broker?
+
+        For every order in the block we compare DB state against the
+        broker's pending-orders list, open-positions list, and (for
+        positions that vanished) trade history:
+
+        =================  =========================  ================================
+        DB state           Broker reality              Action
+        =================  =========================  ================================
+        PENDING            still in pending list       no change
+        PENDING            in open positions           mark FILLED with placeholder SL/TP
+        PENDING            gone (no position)          mark CANCELLED (cancelled mid-air)
+        FILLED + open pos  position still open         no change
+        FILLED + open pos  position closed (SL)        mark SL_HIT, P&L from history
+        FILLED + open pos  position closed (TP)        mark TP_HIT, P&L from history
+        FILLED + open pos  position closed (other)     mark closed with reason="MANUAL"
+        =================  =========================  ================================
+
+        After updating orders we re-run :meth:`_finalise_block_state`
+        so the block-level WIN/LOSS/INVALID transition fires (and
+        the corresponding notification reaches the trader). One
+        consolidated ``BLOCK_RECONCILED`` notification per block
+        keeps the chat from being flooded by N synthetic
+        SL_HIT/TP_HIT events for blocks that closed days ago.
+        """
+        async with session_scope() as session:
+            blocks = await repository.list_active_blocks(session)
+            block_ids = [b.id for b in blocks]
+
+        if not block_ids:
+            logger.info("Reconciliation: no open blocks to sync.")
+            return
+
+        logger.info(
+            "Reconciliation: checking {n} open block(s) against broker state",
+            n=len(block_ids),
+        )
+        for block_id in block_ids:
+            try:
+                await self._reconcile_one_block(block_id)
+            except Exception as exc:  # noqa: BLE001
+                # Don't let one bad block kill startup — the others
+                # might still be salvageable. Operator sees the
+                # exception in the journal and via BLOCK_ERROR.
+                logger.exception(
+                    "Reconciliation failed for block #{id}: {err}",
+                    id=block_id,
+                    err=exc,
+                )
+
+    async def _reconcile_one_block(self, block_id: int) -> None:
+        """Reconcile a single block. Re-fetches the block so we have
+        a fresh session attached to the writes that follow."""
+        async with session_scope() as session:
+            block = await repository.get_block(session, block_id)
+            if block is None or block.is_terminal:
+                return
+
+            # One round-trip per symbol — cheaper than per-order.
+            pendings_raw = await self._adapter.list_pending_orders(
+                symbol=block.symbol
+            )
+            pendings_by_ticket = {
+                p.ticket: p for p in pendings_raw if p.ticket
+            }
+            positions_raw = await self._adapter.list_open_positions(
+                symbol=block.symbol
+            )
+            positions_by_ticket = {p.ticket: p for p in positions_raw}
+
+            changes: list[str] = []
+            now = _utcnow()
+
+            for order in sorted(block.orders, key=lambda o: o.seq):
+                change = await self._reconcile_one_order(
+                    session=session,
+                    order=order,
+                    pendings_by_ticket=pendings_by_ticket,
+                    positions_by_ticket=positions_by_ticket,
+                    now=now,
+                )
+                if change:
+                    changes.append(change)
+
+            if not changes:
+                logger.info(
+                    "Block #{id}: nothing to reconcile, state is consistent",
+                    id=block_id,
+                )
+                return
+
+            # Recompute WIN/LOSS based on the freshly-attributed
+            # orders. ``_finalise_block_state`` reads from the
+            # session's in-memory order objects (we mutated them
+            # directly above), so no flush is required first. The
+            # outer ``session_scope`` will commit everything
+            # atomically once we return.
+            await self._finalise_block_state(session, block)
+
+            # Belt-and-braces: ``_finalise_block_state`` only moves
+            # the block when at least one TP fired or every rung
+            # was an SL. After reconciliation we can land in a
+            # mixed-terminal state — e.g. every order CANCELLED
+            # because the broker dropped pendings while the bot
+            # was down. In that case route the block to a terminal
+            # status by realised P&L, otherwise it would loiter as
+            # ACTIVE forever even though nothing on the broker is
+            # tied to it anymore.
+            await self._finalise_after_reconciliation(session, block)
+
+            await self._notify(
+                notify.block_reconciled(
+                    block_id=block.id,
+                    chat_id=block.chat_id,
+                    changes=changes,
+                    new_status=str(block.status),
+                    net_pnl=block.net_pnl,
+                )
+            )
+
+    async def _reconcile_one_order(
+        self,
+        *,
+        session: AsyncSession,
+        order: Order,
+        pendings_by_ticket: dict[str, OrderResult],
+        positions_by_ticket: dict[str, Position],
+        now: datetime,
+    ) -> str | None:
+        """Apply broker-vs-DB delta for one order. Returns a change
+        description if state moved, else ``None``."""
+        if order.state == OrderState.PENDING:
+            entry_ticket = order.entry_ticket or ""
+            if entry_ticket in pendings_by_ticket:
+                return None        # still pending, no change
+
+            # The pending vanished. Was it filled (position appears)
+            # or cancelled (position never appeared)?
+            if entry_ticket in positions_by_ticket:
+                pos = positions_by_ticket[entry_ticket]
+                await repository.mark_order_filled(
+                    session,
+                    order,
+                    fill_price=float(pos.open_price),
+                    fill_spread=0.0,        # not known retroactively
+                    sl_live=float(pos.sl or order.sl_price_plan),
+                    tp_live=float(pos.tp or 0.0),
+                    position_ticket=pos.ticket,
+                    filled_at=now,
+                )
+                return (
+                    f"#{order.seq} fill recovered "
+                    f"(entry {round(pos.open_price, 5)})"
+                )
+
+            # Neither pending nor open position → cancelled.
+            await repository.mark_order_cancelled(
+                session, order, closed_at=now
+            )
+            return f"#{order.seq} cancelled while bot was down"
+
+        # Already-filled order: is its position still open?
+        if order.state == OrderState.OPEN:
+            position_ticket = order.position_ticket or ""
+            if position_ticket in positions_by_ticket:
+                return None        # still open
+
+            close_info = await self._adapter.get_position_close_info(
+                position_ticket
+            )
+            if close_info is None:
+                # Position gone but no closing deal in history —
+                # shouldn't happen on a real broker. Treat as
+                # CANCELLED with zero P&L so the block can finalise.
+                await repository.mark_order_closed(
+                    session,
+                    order,
+                    state=OrderState.CANCELLED,
+                    close_price=order.entry_price or 0.0,
+                    pnl_usd=0.0,
+                    commission_usd=None,
+                    closed_at=now,
+                )
+                return (
+                    f"#{order.seq} closed (no broker history — "
+                    f"flagged for review)"
+                )
+
+            terminal_state = {
+                "SL": OrderState.SL_HIT,
+                "TP": OrderState.TP_HIT,
+                # Manual / other broker-side closes share a single
+                # state — we don't have a dedicated enum value for
+                # them so we reuse CANCELLED, with the P&L from the
+                # broker preserved on the row.
+                "MANUAL": OrderState.CANCELLED,
+                "OTHER": OrderState.CANCELLED,
+            }.get(close_info.reason, OrderState.CANCELLED)
+
+            await repository.mark_order_closed(
+                session,
+                order,
+                state=terminal_state,
+                close_price=close_info.close_price,
+                pnl_usd=close_info.profit,
+                commission_usd=None,
+                closed_at=close_info.close_time,
+            )
+            return (
+                f"#{order.seq} {close_info.reason} "
+                f"@ {round(close_info.close_price, 5)} "
+                f"(pnl {round(close_info.profit, 2)})"
+            )
+
+        # Terminal states (already SL/TP/cancelled) — nothing to do.
+        return None
+
+    async def _finalise_after_reconciliation(
+        self,
+        session: AsyncSession,
+        block: Block,
+    ) -> None:
+        """Force a terminal state for blocks left in limbo by recon.
+
+        Called only from :meth:`_reconcile_one_block` AFTER
+        :meth:`_finalise_block_state` has had a chance to fire its
+        normal WIN / LOSS logic. The remaining edge case is the
+        all-cancelled / mixed-terminal block: every order has left
+        PENDING/OPEN, but the orders are a mix of CANCELLED, SL_HIT,
+        and TP_HIT (or simply all CANCELLED) so neither WIN nor LOSS
+        triggered. We resolve those by realised P&L:
+
+        * net > 0 → WIN
+        * net < 0 → LOSS
+        * net = 0 → INVALID
+
+        That mirrors :meth:`cancel_block`'s ``_pnl_to_terminal_status``
+        so manual closes and reconciliation pick the same bucket for
+        the same outcome.
+        """
+        if block.status not in (BlockStatus.CREATED, BlockStatus.ACTIVE):
+            return
+
+        terminal_order_states = {
+            OrderState.TP_HIT,
+            OrderState.SL_HIT,
+            OrderState.CANCELLED,
+            OrderState.ERROR,
+        }
+        if not all(o.state in terminal_order_states for o in block.orders):
+            return
+
+        net = sum((o.pnl_usd or 0.0) for o in block.orders)
+        terminal_status = self._pnl_to_terminal_status(net)
+        await repository.set_block_status(
+            session,
+            block,
+            terminal_status,
+            closed_at=_utcnow(),
+            net_pnl=net,
+        )
+        # Map status → audit-log event type so the reconciliation
+        # leaves the same paper trail as a normal terminal
+        # transition would.
+        event_type = {
+            BlockStatus.WIN: EventType.BLOCK_WIN,
+            BlockStatus.LOSS: EventType.BLOCK_LOSS,
+            BlockStatus.INVALID: EventType.BLOCK_INVALID,
+        }.get(terminal_status, EventType.BLOCK_ERROR)
+        await repository.append_event(
+            session,
+            block_id=block.id,
+            event_type=event_type,
+            payload={"net_pnl": net, "via": "reconciliation"},
+        )
 
     # ===================================================================
     # Public API: manual close

@@ -35,6 +35,7 @@ class NotificationType(StrEnum):
     BLOCK_INVALID = "BLOCK_INVALID"
     BLOCK_ERROR = "BLOCK_ERROR"
     BLOCK_MANUAL_CLOSE = "BLOCK_MANUAL_CLOSE"
+    BLOCK_RECONCILED = "BLOCK_RECONCILED"
     SPREAD_ALERT = "SPREAD_ALERT"
     SESSION_FILTER_BLOCKED = "SESSION_FILTER_BLOCKED"
 
@@ -130,6 +131,24 @@ def block_error(
         block_id=block_id,
         chat_id=chat_id,
         payload={"reason": reason, **payload},
+    )
+
+
+def block_reconciled(
+    *, block_id: int, chat_id: int, **payload: Any
+) -> Notification:
+    """Bot startup reconciliation finished for this block.
+
+    Payload carries ``changes`` (a list of human-readable change
+    strings the renderer joins into one message), ``new_status``
+    (the recomputed block status string), and ``net_pnl`` (None
+    when the block is still ACTIVE / CREATED).
+    """
+    return Notification(
+        type=NotificationType.BLOCK_RECONCILED,
+        block_id=block_id,
+        chat_id=chat_id,
+        payload=payload,
     )
 
 

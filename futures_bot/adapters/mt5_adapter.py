@@ -33,6 +33,7 @@ from loguru import logger
 
 from futures_bot.adapters.base import (
     BrokerAdapter,
+    ClosedPositionInfo,
     OrderRequest,
     OrderResult,
     Position,
@@ -76,6 +77,24 @@ _ORDER_FILLING_RETURN = 2
 # symbol filling-mode bitmask
 _SYMBOL_FILLING_FOK = 1
 _SYMBOL_FILLING_IOC = 2
+
+# MT5 deal-reason codes (see official MetaTrader5 Python integration
+# docs). We translate them into the broker-agnostic string codes the
+# rest of the bot uses so the engine never has to import MT5
+# constants.
+_DEAL_REASON_SL = 4
+_DEAL_REASON_TP = 5
+
+# Deal entry direction. ``DEAL_ENTRY_OUT`` is the closing leg of a
+# position — that's the one whose ``reason`` tells us *why* the
+# position closed.
+_DEAL_ENTRY_OUT = 1
+
+# How far back to search the trade history when reconciling. A week
+# is enough for our weekly-trading horizon and short enough to keep
+# the RPC call cheap; the trader's own log will surface anything
+# older that needs attention.
+_HISTORY_LOOKBACK_DAYS = 7
 
 # retcodes — successful outcomes
 _TRADE_RETCODE_PLACED = 10008       # pending order accepted
@@ -629,6 +648,79 @@ class MT5Adapter(BrokerAdapter):
     ) -> list[OrderResult]:
         async with self._lock:
             return await asyncio.to_thread(self._sync_list_pending, symbol)
+
+    async def get_position_close_info(
+        self, ticket: str
+    ) -> ClosedPositionInfo | None:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_get_position_close_info, ticket
+            )
+
+    def _sync_get_position_close_info(
+        self, ticket: str
+    ) -> ClosedPositionInfo | None:
+        """Query MT5 trade history for a position's closing deal.
+
+        ``history_deals_get(position=N)`` returns *every* deal that
+        touched the position — opening, partial fills, and closing.
+        The closing deal is identified by ``entry == DEAL_ENTRY_OUT``;
+        its ``reason`` field carries the SL/TP code we need.
+
+        Returns ``None`` if no closing deal is found, which the
+        engine interprets as "still open or never filled".
+        """
+        client = self._require_client()
+        try:
+            ticket_int = int(ticket)
+        except (TypeError, ValueError):
+            return None
+
+        from datetime import datetime as _dt, timedelta as _td
+
+        # The MT5 binding requires a datetime range. We look back
+        # ``_HISTORY_LOOKBACK_DAYS`` (a week) — more than enough for
+        # the bot's restart-reconciliation use case and short enough
+        # to keep the RPC payload tight.
+        to_dt = _dt.utcnow()
+        from_dt = to_dt - _td(days=_HISTORY_LOOKBACK_DAYS)
+
+        deals = client.history_deals_get(from_dt, to_dt, position=ticket_int)
+        if not deals:
+            # Some mt5linux versions return None when the position
+            # is still open; others return an empty tuple. Either
+            # way the answer is "no close info yet".
+            return None
+
+        # Find the closing deal — DEAL_ENTRY_OUT == 1. If there are
+        # multiple (partial closes), we take the LAST one because
+        # that is the one that took the position to zero volume.
+        closing = None
+        for d in deals:
+            if int(getattr(d, "entry", -1)) == _DEAL_ENTRY_OUT:
+                closing = d
+        if closing is None:
+            return None
+
+        reason_code = int(getattr(closing, "reason", -1))
+        if reason_code == _DEAL_REASON_SL:
+            reason = "SL"
+        elif reason_code == _DEAL_REASON_TP:
+            reason = "TP"
+        elif reason_code in (0, 1, 2, 3):
+            reason = "MANUAL"
+        else:
+            reason = "OTHER"
+
+        return ClosedPositionInfo(
+            ticket=ticket,
+            close_price=float(closing.price),
+            close_time=datetime.fromtimestamp(
+                int(closing.time), tz=timezone.utc
+            ),
+            profit=float(closing.profit),
+            reason=reason,
+        )
 
     def _sync_list_pending(self, symbol: str | None) -> list[OrderResult]:
         client = self._require_client()

@@ -28,6 +28,7 @@ CHANNEL_EVENT_TYPES: frozenset[NotificationType] = frozenset({
     NotificationType.BLOCK_LOSS,
     NotificationType.BLOCK_INVALID,
     NotificationType.BLOCK_ERROR,
+    NotificationType.BLOCK_RECONCILED,
 })
 
 
