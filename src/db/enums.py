@@ -31,12 +31,13 @@ class BlockStatus(StrEnum):
 class OrderState(StrEnum):
     """Lifecycle of an individual order inside a block."""
 
-    PENDING = "PENDING"       # entry limit on the order book, not yet filled
-    TRIGGERED = "TRIGGERED"   # entry filled; position open with TP/SL alive
-    TP_HIT = "TP_HIT"         # closed via take-profit
-    SL_HIT = "SL_HIT"         # closed via stop-loss
-    CANCELLED = "CANCELLED"   # entry cancelled before triggering
-    ERROR = "ERROR"           # placement or close failed
+    PENDING = "PENDING"           # entry limit on the order book, not yet filled
+    TRIGGERED = "TRIGGERED"       # entry filled; position open with TP/SL alive
+    TP_HIT = "TP_HIT"             # closed via take-profit
+    SL_HIT = "SL_HIT"             # closed via stop-loss
+    LIQUIDATED = "LIQUIDATED"     # closed via Binance liquidation (margin call)
+    CANCELLED = "CANCELLED"       # entry cancelled before triggering
+    ERROR = "ERROR"               # placement or close failed
 
 
 class EventType(StrEnum):
@@ -48,6 +49,8 @@ class EventType(StrEnum):
     ORDER_TRIGGERED = "ORDER_TRIGGERED"
     TP_HIT = "TP_HIT"
     SL_HIT = "SL_HIT"
+    RUNG_LIQUIDATED = "RUNG_LIQUIDATED"
+    CHAIN_RESTART = "CHAIN_RESTART"
     ORDER_CANCELLED = "ORDER_CANCELLED"
     BLOCK_WIN = "BLOCK_WIN"
     BLOCK_LOSS = "BLOCK_LOSS"

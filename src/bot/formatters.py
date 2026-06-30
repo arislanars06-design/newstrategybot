@@ -84,7 +84,7 @@ def _status_emoji(status: BlockStatus) -> str:
     }.get(status, "•")
 
 
-# Short tag the user wants in the per-rung list ("1/8 SL"). The
+# Short tag the user wants in the per-rung list ("1/6 SL"). The
 # trader's vocabulary is slightly different from the engine's:
 # TRIGGERED (the position is open and waiting on its TP/SL) reads as
 # "АКТИВЕН" in their world, while a CREATED-but-not-yet-placed rung
@@ -182,8 +182,8 @@ def format_block_detail(
         Статус: ACTIVE
 
         Ордера:
-        1/8 SL
-        2/8 АКТИВЕН
+        1/6 SL
+        2/6 АКТИВЕН
         ...
 
         Текущий PnL: +12.5
@@ -454,7 +454,7 @@ def render_notification(n: Notification) -> str:
         net = p.get("net_pnl") or 0.0
         return (
             f"🔴 <b>БЛОК #{n.block_id} LOSS</b>\n"
-            f"Все 8 ордеров остановлены по SL.\n"
+            f"Все 6 ордеров остановлены по SL.\n"
             f"Итоговый PnL: <b>{_signed(net, 4)}</b>"
         )
     if n.type == NotificationType.BLOCK_INVALID:
@@ -475,6 +475,23 @@ def render_notification(n: Notification) -> str:
         )
     if n.type == NotificationType.BLOCK_MANUAL_CLOSE:
         return f"✋ <b>БЛОК #{n.block_id}</b> закрыт вручную."
+    if n.type == NotificationType.RUNG_LIQUIDATED:
+        seq = p.get("seq")
+        exit_price = p.get("exit_price")
+        pnl = p.get("pnl") or 0.0
+        replaced = p.get("replaced_seqs") or []
+        chain_line = (
+            f"\n🔗 Цепочка восстановлена: переразмещены ордера "
+            f"{', '.join(f'#{s}' for s in replaced)}."
+            if replaced
+            else "\n⚠️ Следующих ступеней не было — блок завершён."
+        )
+        return (
+            f"🔥 <b>БЛОК #{n.block_id} — Ордер #{seq} ЛИКВИДИРОВАН</b>\n"
+            f"Цена выхода: <code>{exit_price}</code>\n"
+            f"Потеря: <b>{_signed(pnl, 4)}</b>"
+            f"{chain_line}"
+        )
     return f"БЛОК #{n.block_id} — {n.type}: {n.payload}"
 
 

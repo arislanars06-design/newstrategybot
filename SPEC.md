@@ -10,7 +10,7 @@ is implemented in code under `src/` and verified by smoke tests.
 ## 1. Core unit — the BLOCK
 
 ```
-1 BLOCK = 8 chained limit orders on the same symbol and side
+1 BLOCK = 6 chained limit orders on the same symbol and side
 ```
 
 Each order carries its own:
@@ -77,13 +77,14 @@ menu button drives. The trader supplies five values:
 
 Every other number is derived. The bot:
 
-* Computes 8 entry prices at Fibonacci levels **61.8, 70.2, 78.6,
-  89.3, 100, 111.8, 123.6 and 130.9 percent** of the user-supplied
-  range.
+* Computes 6 entry prices at Fibonacci levels **61.80, 74.53, 87.26,
+  100.00, 112.73 and 125.46 percent** of the user-supplied range.
+  Levels are uniformly spaced at ~12.73 % apart inside the 61.8 %
+  to 138.2 % band, giving every rung an equal SL distance.
 * Chains stop-losses so each rung's SL equals the next rung's entry;
   the eighth rung's SL sits at level 138.2% — one Fib step beyond
   the last entry.
-* Sizes each rung's USD risk via a geometric 1.5× progression from
+* Sizes each rung's USD risk via a geometric **2×** progression from
   the trader's first-rung input. Total max risk across the ladder is
   approximately **49.26 ×** the first-rung risk.
 * Sets per-rung TP ratios at **1:5 for rungs 1–3, then 5.64, 6.42,
@@ -96,19 +97,19 @@ Every other number is derived. The bot:
 
 The preview screen shows the entire ladder plus totals (max risk,
 collateral required, notional). On confirmation the engine places
-all 24 orders (8 entries + 8 TPs + 8 SLs) in a single batch through
+all 18 orders (6 entries + 6 TPs + 6 SLs) in a single batch through
 the same `engine.create_block()` path used by `/newblock`.
 
 ### `/newblock` — bot places explicit prices
 
-The trader drives an FSM through Telegram (symbol → side → 8 entries
+The trader drives an FSM through Telegram (symbol → side → 6 entries
 → 8 TPs → last SL → cancel price → qty). Useful when the trader
 wants prices that don't fit a Fibonacci grid. The engine validates
 the plan, persists it, and then sends each order to Binance.
 
 ### `/track` — bot adopts orders the trader placed manually
 
-The trader places the 8 entries (each with its own TP and SL) directly
+The trader places the 6 entries (each with its own TP and SL) directly
 on Binance or via TradingView's trading panel, then runs `/track`. The
 engine reads the open-orders list, classifies orders into entry / TP
 / SL buckets, pairs them by quantity + price index, and shows the
@@ -152,7 +153,7 @@ strict — no state is ever revisited.
 |----------|-----------------------------------------------------------|
 | ACTIVE   | All orders persisted; the block is being watched.          |
 | WIN      | **Any single rung's TP fires.** Pending entries cancelled. |
-| LOSS     | All 8 rungs ended at SL with no TP hit anywhere.           |
+| LOSS     | All 6 rungs ended at SL with no TP hit anywhere.           |
 | INVALID  | Mark price hits `cancel_price` *before any entry triggers*. |
 | ERROR    | Unrecoverable problem (e.g. failed initial placement).     |
 
@@ -323,8 +324,8 @@ must never block trading.
 
 ## 10. The single inviolable rule
 
-> **A block is one lifecycle of 8 orders. The lifecycle ends only on
-> TP (→ WIN), all 8 SLs (→ LOSS), or cancel-price hit before any
+> **A block is one lifecycle of 6 orders. The lifecycle ends only on
+> TP (→ WIN), all 6 SLs (→ LOSS), or cancel-price hit before any
 > trigger (→ INVALID).**
 
 Nothing else (clock time, drawdown, manual whim) can move a block to

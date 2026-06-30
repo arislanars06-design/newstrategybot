@@ -22,6 +22,9 @@ CHANNEL_EVENT_TYPES: frozenset[NotificationType] = frozenset({
     NotificationType.BLOCK_LOSS,
     NotificationType.BLOCK_INVALID,
     NotificationType.BLOCK_ERROR,
+    # A liquidation that triggers a chain restart is a block-level
+    # event the trader wants visibility on, on par with WIN/LOSS.
+    NotificationType.RUNG_LIQUIDATED,
 })
 
 
