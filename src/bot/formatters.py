@@ -475,6 +475,23 @@ def render_notification(n: Notification) -> str:
         )
     if n.type == NotificationType.BLOCK_MANUAL_CLOSE:
         return f"✋ <b>БЛОК #{n.block_id}</b> закрыт вручную."
+    if n.type == NotificationType.RUNG_LIQUIDATED:
+        seq = p.get("seq")
+        exit_price = p.get("exit_price")
+        pnl = p.get("pnl") or 0.0
+        replaced = p.get("replaced_seqs") or []
+        chain_line = (
+            f"\n🔗 Цепочка восстановлена: переразмещены ордера "
+            f"{', '.join(f'#{s}' for s in replaced)}."
+            if replaced
+            else "\n⚠️ Следующих ступеней не было — блок завершён."
+        )
+        return (
+            f"🔥 <b>БЛОК #{n.block_id} — Ордер #{seq} ЛИКВИДИРОВАН</b>\n"
+            f"Цена выхода: <code>{exit_price}</code>\n"
+            f"Потеря: <b>{_signed(pnl, 4)}</b>"
+            f"{chain_line}"
+        )
     return f"БЛОК #{n.block_id} — {n.type}: {n.payload}"
 
 

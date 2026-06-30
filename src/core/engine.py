@@ -491,19 +491,286 @@ class BlockEngine:
 
         Matching strategy:
 
-        1. If the client_order_id parses as one we generated (managed
-           blocks created via /newblock), use it directly — it carries
-           block_id and seq, so the lookup is O(1) and works even
-           before we have persisted the exchange order_id.
-        2. Otherwise (tracked blocks, or any race where the client_id
+        1. If the client_order_id starts with Binance's ``autoclose-``
+           prefix, the event is a forced liquidation (margin call /
+           bankruptcy auto-close). Route it to :meth:`_on_liquidation`
+           which marks the rung as ``LIQUIDATED`` and re-places any
+           subsequent rungs Binance cancelled in the process — this
+           is how the chain keeps going past a single rung's
+           liquidation.
+        2. If the client_order_id parses as one we generated (managed
+           blocks created via /newblock or /fib), use it directly —
+           it carries block_id and seq, so the lookup is O(1) and
+           works even before we have persisted the exchange order_id.
+        3. Otherwise (tracked blocks, replacement orders whose ids
+           don't follow our prefix, or any race where the client_id
            shortcut is unavailable) fall back to looking up by the
            Binance ``orderId`` against entry/tp/sl_order_id columns.
         """
+        if update.client_order_id.startswith("autoclose-"):
+            await self._on_liquidation(update)
+            return
         parsed = _parse_client_id(update.client_order_id)
         if parsed is not None:
             await self._dispatch_with_lock_managed(parsed, update)
             return
         await self._dispatch_with_lock_tracked(update)
+
+    async def _on_liquidation(self, update: OrderUpdate) -> None:
+        """React to a Binance forced-liquidation event.
+
+        Binance signals a liquidation by sending an ORDER_TRADE_UPDATE
+        whose client_order_id starts with ``autoclose-``. The event
+        represents the synthetic market order Binance creates to
+        close the position at the bankruptcy price.
+
+        Side effects:
+
+        1. Find the active block whose ``TRIGGERED`` rung corresponds
+           to the liquidated position (matched by symbol + position
+           side).
+        2. Mark that rung as ``LIQUIDATED`` with the actual exit price
+           and realised PnL from the event.
+        3. Cancel the rung's now-orphan TP (Binance usually does this
+           too, but we do it idempotently as defense in depth).
+        4. Re-place every subsequent rung that Binance auto-cancelled
+           on liquidation (entries N+1..last). Each replacement uses
+           a fresh client_order_id (``-r{n}`` suffix) so we don't
+           collide with the cancelled order in Binance's dedup window.
+        5. Emit ``RUNG_LIQUIDATED`` notification so the trader sees
+           the chain restart in Telegram.
+
+        Only fires on terminal fill events (``update.is_filled``).
+        Intermediate states from the liquidation engine are ignored.
+        """
+        if not update.is_filled:
+            return
+
+        async with session_scope() as session:
+            active = await repository.list_active_blocks(session)
+            target_block_id = None
+            target_seq = None
+            for b in active:
+                if b.symbol != update.symbol:
+                    continue
+                expected = (
+                    "LONG" if b.side == BlockSide.BUY else "SHORT"
+                )
+                if (
+                    update.position_side
+                    and update.position_side != "BOTH"
+                    and update.position_side != expected
+                ):
+                    continue
+                triggered = [
+                    o for o in b.orders if o.state == OrderState.TRIGGERED
+                ]
+                if not triggered:
+                    continue
+                target_block_id = b.id
+                # Pick the lowest-seq triggered rung — chain only ever
+                # has one open position at a time, so this is unique
+                # in practice. If we ever see multiple, log it.
+                if len(triggered) > 1:
+                    logger.warning(
+                        "Liquidation: block={b} has {n} TRIGGERED rungs; "
+                        "picking the lowest seq", b=b.id, n=len(triggered),
+                    )
+                target_seq = min(o.seq for o in triggered)
+                break
+
+        if target_block_id is None:
+            logger.warning(
+                "Liquidation event for {sym}/{ps} did not match any active "
+                "block with a TRIGGERED rung — ignoring",
+                sym=update.symbol, ps=update.position_side,
+            )
+            return
+
+        async with self._lock_for(target_block_id):
+            await self._apply_liquidation(target_block_id, target_seq, update)
+
+    async def _apply_liquidation(
+        self, block_id: int, seq: int, update: OrderUpdate
+    ) -> None:
+        """Apply liquidation effects to a single rung and restart the chain."""
+        async with session_scope() as session:
+            block = await repository.get_block(session, block_id)
+            if block is None or block.is_terminal:
+                return
+            rung = next((o for o in block.orders if o.seq == seq), None)
+            if rung is None or rung.state != OrderState.TRIGGERED:
+                return
+
+            # 1. Mark rung as LIQUIDATED. PnL is best-effort: prefer
+            # exchange-reported realisedPnl; fall back to entry/exit
+            # math.
+            pnl = update.realized_pnl
+            if not pnl and rung.filled_entry_price is not None:
+                direction = 1 if block.side == BlockSide.BUY else -1
+                pnl = direction * (
+                    update.avg_fill_price - rung.filled_entry_price
+                ) * rung.qty
+            await repository.update_order_state(
+                session,
+                rung,
+                OrderState.LIQUIDATED,
+                filled_exit_price=update.avg_fill_price,
+                pnl=pnl,
+            )
+            await repository.add_event(
+                session,
+                block_id=block.id,
+                order_seq=rung.seq,
+                event_type=EventType.RUNG_LIQUIDATED,
+                payload={
+                    "exit_price": update.avg_fill_price,
+                    "pnl": pnl,
+                },
+            )
+
+            # 2. Orphan TP cancel (idempotent).
+            await self._cancel_one_order(block, rung, "t")
+
+            # 3. Re-place subsequent rungs.
+            chat_id = block.chat_id
+            symbol = block.symbol
+            side = block.side
+            following = [
+                o for o in block.orders
+                if o.seq > rung.seq and o.state in (
+                    OrderState.PENDING, OrderState.CANCELLED
+                )
+            ]
+
+        replaced: list[int] = []
+        for follower in following:
+            try:
+                await self._replace_rung_orders(block_id, follower.seq)
+                replaced.append(follower.seq)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Chain restart: re-placement failed for block={b} "
+                    "seq={s}; aborting further re-placements",
+                    b=block_id, s=follower.seq,
+                )
+                # Mark block ERROR and stop — partial restart is worse
+                # than no restart because the trader can't reason about
+                # what's on Binance.
+                await self._mark_block_error(
+                    block_id,
+                    f"chain restart failed at rung {follower.seq}: {exc}",
+                )
+                return
+
+        if replaced:
+            async with session_scope() as session:
+                await repository.add_event(
+                    session,
+                    block_id=block_id,
+                    event_type=EventType.CHAIN_RESTART,
+                    payload={
+                        "from_seq": rung.seq + 1,
+                        "replaced_seqs": replaced,
+                    },
+                )
+
+        # 4. Notify the trader. One message per liquidation; the chain
+        # restart is summarised in the same payload so the trader sees
+        # it without parsing two notifications.
+        await self._notify(
+            type_=NotificationType.RUNG_LIQUIDATED,
+            block_id=block_id,
+            chat_id=chat_id,
+            payload={
+                "seq": rung.seq,
+                "exit_price": update.avg_fill_price,
+                "pnl": pnl,
+                "replaced_seqs": replaced,
+            },
+        )
+
+    async def _replace_rung_orders(self, block_id: int, seq: int) -> None:
+        """Place a fresh entry+SL pair for a rung after Binance cancelled them.
+
+        Uses a fresh client_order_id (with a millisecond suffix) so we
+        sidestep Binance's 5-minute dedup window on the original ids.
+        The order rows in the DB get their new exchange ids updated;
+        client_ids are NOT changed in the DB because every other code
+        path keys off them. Replacement client_ids don't match our
+        regex (intentionally) — fill events for them route through
+        the ``_dispatch_with_lock_tracked`` path via exchange order id.
+        """
+        async with session_scope() as session:
+            block = await repository.get_block(session, block_id)
+            assert block is not None
+            rung = next(o for o in block.orders if o.seq == seq)
+            entry_client_id = rung.entry_client_id
+            sl_client_id = rung.sl_client_id
+            symbol = block.symbol
+            side = block.side
+            entry_price = rung.entry_price
+            sl_price = rung.sl_price
+            qty = rung.qty
+
+        # Fresh client ids for the replacement to dodge Binance's
+        # dedup window. ``-r{epoch_ms}`` is unique per replacement.
+        import time
+        suffix = f"-r{int(time.time() * 1000)}"
+        new_entry_cid = (entry_client_id + suffix)[:36]  # Binance caps at 36
+        new_sl_cid = (sl_client_id + suffix)[:36]
+
+        entry_side = _entry_side_for(side)
+        exit_side = _exit_side_for(side)
+        position_side = _position_side_for(side)
+
+        entry_id = await self._client.place_entry_limit(
+            symbol=symbol,
+            side=entry_side,
+            position_side=position_side,
+            qty=qty,
+            price=entry_price,
+            client_id=new_entry_cid,
+        )
+        try:
+            sl_id = await self._client.place_sl_stop(
+                symbol=symbol,
+                side=exit_side,
+                position_side=position_side,
+                qty=qty,
+                stop_price=sl_price,
+                client_id=new_sl_cid,
+            )
+        except Exception:
+            # Roll back the entry we just placed, mirror the upfront
+            # placement logic in _place_entry_orders.
+            try:
+                await self._client.cancel_order_by_client_id(
+                    symbol, new_entry_cid
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "Replacement rollback: cancel of fresh entry %s failed",
+                    new_entry_cid,
+                )
+            raise
+
+        async with session_scope() as session:
+            fresh_block = await repository.get_block(session, block_id)
+            assert fresh_block is not None
+            target = next(
+                o for o in fresh_block.orders if o.seq == seq
+            )
+            target.entry_order_id = entry_id
+            target.sl_order_id = sl_id
+            target.state = OrderState.PENDING
+            # Clear any stale exit-side fields from the cancelled
+            # incarnation; the rung is "fresh" again.
+            target.filled_entry_price = None
+            target.filled_exit_price = None
+            target.pnl = None
+            target.triggered_at = None
+            target.closed_at = None
 
     async def _dispatch_with_lock_managed(
         self, parsed: _ParsedClientId, update: OrderUpdate
@@ -840,6 +1107,7 @@ class BlockEngine:
         terminal_states = {
             OrderState.TP_HIT,
             OrderState.SL_HIT,
+            OrderState.LIQUIDATED,
             OrderState.CANCELLED,
             OrderState.ERROR,
         }
@@ -847,7 +1115,13 @@ class BlockEngine:
             return  # still some pending or triggered
 
         any_tp = any(o.state == OrderState.TP_HIT for o in block.orders)
-        any_sl = any(o.state == OrderState.SL_HIT for o in block.orders)
+        # LIQUIDATED rungs count as losing rungs for the LOSS-vs-INVALID
+        # decision. The block is considered LOSS if any rung ended at
+        # SL_HIT or LIQUIDATED with no TP anywhere.
+        any_sl = any(
+            o.state in (OrderState.SL_HIT, OrderState.LIQUIDATED)
+            for o in block.orders
+        )
 
         net_pnl = _compute_net_pnl(block)
 
