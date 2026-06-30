@@ -1,6 +1,6 @@
 """Discover and group user-placed orders on Binance Futures.
 
-Used by the ``/track`` Telegram flow: the user manually places 8 entries
+Used by the ``/track`` Telegram flow: the user manually places 6 entries
 and pairs each with a TP and SL on Binance (or TradingView). The bot
 reads the open-orders list, filters out anything already adopted by an
 active block, and proposes a ladder for the user to confirm.
@@ -130,7 +130,7 @@ def auto_detect_side(
     if n_buy == 0 and n_sell == 0:
         return None, (
             "No unassigned LIMIT entry orders found on this symbol. "
-            "Place 8 entries on the chart first, then run /track."
+            "Place 6 entries on the chart first, then run /track."
         )
     if n_buy >= expected_rungs and n_sell >= expected_rungs:
         return None, (
@@ -163,7 +163,7 @@ def discover_block(
         blocks; they will be excluded so multiple blocks on the same
         symbol don't fight for the same orders.
     expected_rungs:
-        Required number of entries; defaults to 8 to match the user's
+        Required number of entries; defaults to 6 to match the user's
         strategy.
     """
     # 1. Filter out orders that already belong to other blocks.

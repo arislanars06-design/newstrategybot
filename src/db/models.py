@@ -32,7 +32,7 @@ def _utcnow() -> datetime:
 
 
 class Block(Base):
-    """A group of 8 chained limit orders that share lifecycle and a Cancel Price."""
+    """A group of 6 chained limit orders that share lifecycle and a Cancel Price."""
 
     __tablename__ = "blocks"
 

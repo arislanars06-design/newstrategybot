@@ -6,27 +6,35 @@ the chart — decides the prices. The trader provides only:
 * the symbol and side (BUY / SELL)
 * the 0% and 100% anchor prices defining the Fibonacci range
 * the first rung's dollar risk
-* the cancel ("price invalid") price
+* the leverage (which the bot also pushes to Binance)
+
+The cancel ("price invalid") price is auto-derived from the 0%
+anchor — see :func:`fib_leverage` in the bot layer.
 
 The bot computes everything else:
 
-* 8 entry prices at Fibonacci levels 61.8, 70.2, 78.6, 89.3, 100,
-  111.8, 123.6 and 130.9 percent of the user-supplied range.
-* 8 chained stop-losses where each rung's SL equals the next rung's
-  entry (so the chain rolls down naturally), and rung 8's SL sits at
-  level 138.2 % — one Fib step beyond the last entry.
-* 8 take-profits sized by per-rung risk:reward ratios. Rungs 1–3 use
-  1:5; rungs 4–8 ramp through 5.64 → 5.42 → 6.95 → 7.30 → 7.53.
-* Per-rung dollar risk that grows by 1.5× each step, so the trader
-  enters a single number ("first risk") and the bot expands it across
-  the ladder.
+* **6 entry prices** at Fibonacci levels 61.8, 74.53, 87.26, 100,
+  112.73 and 125.46 percent of the user-supplied range. The levels
+  are uniformly spaced at ~12.73 % apart inside the 0.618..1.382
+  band, so every rung has the same SL distance in fraction-of-range
+  terms.
+* 6 chained stop-losses where each rung's SL equals the next rung's
+  entry (chain mechanism). Rung 6's SL sits at level 138.2 % — one
+  Fib step beyond the last entry.
+* 6 take-profits at a uniform **1:7 risk-to-reward ratio**: each TP
+  sits at ``entry + 7 × SL_distance`` (for BUY) or
+  ``entry - 7 × SL_distance`` (for SELL).
+* Per-rung dollar risk that **doubles** each step (``RISK_MULTIPLIER
+  = 2.0``), so the trader enters a single number ("first risk") and
+  the bot expands it across the ladder: 1, 2, 4, 8, 16, 32 ×
+  first_risk.
 * Per-rung margin (and the resulting qty) computed from
   ``risk * 100 / (sl_pct * leverage)`` — exactly the formula the
   trader laid out.
 
-Leverage is **not** asked from the user: the bot reads it directly
-from Binance for the symbol+side via ``BinanceClient.get_leverage``.
-That keeps the FSM at five inputs total, matching the trader's spec.
+Total ladder size:
+  Max planned loss = first_risk × (1 + 2 + 4 + 8 + 16 + 32) = 63×.
+  At first_risk=$1 that's $63; at $10 it's $630.
 """
 
 from __future__ import annotations
@@ -36,18 +44,29 @@ from dataclasses import dataclass
 from src.core.plan import EXPECTED_ORDERS_PER_BLOCK, BlockPlan, OrderSpec
 from src.db.enums import BlockSide
 
-# Standard Fibonacci levels used by the strategy. 10 levels.
-# Entries occupy indices 1..8 (61.8 % through 130.9 %).
-# SL of rung N sits at index N+1, so rung 8's SL is at index 9 = 138.2 %.
+# Standard Fibonacci levels used by the strategy. 8 levels = 1 cancel
+# anchor + 6 entries + 1 final SL.
+# Entries occupy indices 1..6 (61.8 % through 125.46 %).
+# SL of rung N sits at index N+1, so rung 6's SL is at index 7 = 138.2 %.
+# The 0.618..1.382 band is divided into 6 equal segments of ~12.73 %
+# each, giving every rung the same SL distance as a fraction of the
+# user-supplied 0%..100% range.
 FIB_LEVELS: list[float] = [
-    0.0, 0.618, 0.702, 0.786, 0.893, 1.0, 1.118, 1.236, 1.309, 1.382,
+    0.0,
+    0.6180,
+    0.7453,
+    0.8726,
+    1.0000,
+    1.1273,
+    1.2546,
+    1.3820,
 ]
 
-# Risk:reward ratios per rung, exactly as the trader specified.
-TP_RATIOS: list[float] = [5.0, 5.0, 5.0, 5.64, 6.42, 6.95, 7.30, 7.53]
+# Risk:reward ratios per rung. Uniform 1:7 across the whole ladder.
+TP_RATIOS: list[float] = [7.0, 7.0, 7.0, 7.0, 7.0, 7.0]
 
 # Risk grows by this factor each rung.
-RISK_MULTIPLIER: float = 1.5
+RISK_MULTIPLIER: float = 2.0
 
 # Default leverage when Binance can't be queried (e.g. unit tests).
 DEFAULT_LEVERAGE: int = 10
@@ -118,8 +137,16 @@ def compute_fib_plan(
         raise ValueError("Leverage must be positive.")
 
     levels = fib_prices(zero_price, hundred_price)
-    entries = [levels[i] for i in range(1, 9)]  # indices 1..8
-    sls = [levels[i] for i in range(2, 10)]     # indices 2..9 (each SL = next level)
+    # Slices are derived from EXPECTED_ORDERS_PER_BLOCK so the formula
+    # adapts automatically if the rung count is ever tuned again.
+    # Entries take indices 1..N (skipping 0 which is the cancel anchor).
+    # SLs take indices 2..N+1 — each rung's SL equals the next rung's
+    # entry, and the last rung's SL is one Fib step beyond the last
+    # entry. FIB_LEVELS must therefore contain exactly N+2 elements
+    # (1 cancel anchor + N entries + 1 final SL).
+    n = EXPECTED_ORDERS_PER_BLOCK
+    entries = [levels[i] for i in range(1, n + 1)]
+    sls = [levels[i] for i in range(2, n + 2)]
 
     # The ladder must run in the direction the side implies. For SELL
     # we sell into a rally → entries ascend. For BUY we buy a dip →

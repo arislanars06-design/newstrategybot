@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from src.db.enums import BlockSide
 
-EXPECTED_ORDERS_PER_BLOCK = 8
+EXPECTED_ORDERS_PER_BLOCK = 6
 
 
 @dataclass(slots=True)
